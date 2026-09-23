@@ -146,6 +146,76 @@ def compute_basis(max_age_hours: float = 36.0) -> Dict:
     )
 
 
+def _dia_factor(max_days: int = 20) -> Optional[float]:
+    """ضریب تبدیل DIA به شاخص، از بسته شدن روزهای مشترک.
+
+    تقریبا ۱۰۰ است ولی دقیقا نه — و به مرور جابه جا می شود، پس
+    هرگز عدد ثابت استفاده نمی شود.
+    """
+    dia = _get("DIA", "1d", f"{max_days}d", prepost=False)
+    dji = _get(_CASH, "1d", f"{max_days}d", prepost=False)
+    if not dia or not dji:
+        return None
+
+    def _ser(res):
+        out = {}
+        try:
+            q = res["indicators"]["quote"][0]
+            for t, c in zip(res["timestamp"], q["close"]):
+                if c is not None:
+                    d = _dt.datetime.fromtimestamp(t, _dt.timezone.utc).date()
+                    out[d] = float(c)
+        except Exception:
+            pass
+        return out
+
+    a, b = _ser(dia), _ser(dji)
+    com = sorted(set(a) & set(b))
+    if not com:
+        return None
+    return b[com[-1]] / a[com[-1]]
+
+
+def freshest() -> Dict:
+    """کدام منبع همین لحظه تازه ترین داده را دارد؟
+
+    هر سه نامزد سنجیده می شوند و آن که کمترین سن را دارد انتخاب
+    می شود. با این کار در جلسه نیویورک خودکار به شاخص نقدی سوییچ
+    می کند و در جلسه لندن به فیوچرز — بدون قاعده ساعتی دستی.
+    """
+    out = []
+
+    px, ts = _last_tick(_get(_CASH, "1m", "1d", prepost=True))
+    if px:
+        out.append(dict(key="cash", symbol=_CASH, index=px,
+                        age=_fresh_minutes(ts),
+                        label="شاخص نقدی (^DJI)", exact=True))
+
+    px, ts = _last_tick(_get("DIA", "1m", "1d", prepost=True))
+    if px:
+        k = _dia_factor()
+        if k:
+            out.append(dict(key="dia", symbol="DIA", index=px * k,
+                            age=_fresh_minutes(ts), factor=round(k, 4),
+                            label=f"صندوق DIA (ضریب {k:.2f})", exact=False))
+
+    px, ts = _last_tick(_get(_FUT, "1m", "1d", prepost=True))
+    if px:
+        b = compute_basis()
+        if b.get("ok"):
+            out.append(dict(key="fut", symbol=_FUT, index=px - b["basis"],
+                            age=_fresh_minutes(ts), basis=b["basis"],
+                            label=f"فیوچرز (پایه {b['basis']:+,.0f})",
+                            exact=False))
+
+    valid = [c for c in out if c.get("age") is not None]
+    if not valid:
+        return dict(ok=False, error="هیچ منبعی داده نداد", candidates=out)
+
+    valid.sort(key=lambda c: c["age"])
+    return dict(ok=True, best=valid[0], candidates=valid)
+
+
 def cash_price(ttl: float = 20.0) -> Dict:
     """
     بهترین تخمین از قیمتی که پلتفرم معاملاتی نشان می دهد.
@@ -232,6 +302,17 @@ def cash_price(ttl: float = 20.0) -> Dict:
         out["prev_close"] = round(prev_close, 2)
         out["change"] = round(out["price"] - prev_close, 2)
         out["change_pct"] = round((out["price"] / prev_close - 1) * 100, 3)
+
+    # شفافیت درباره تأخیر — اندازه گیری شده، نه ادعا شده
+    age = out.get("age_min")
+    if age is not None:
+        if age <= 1.5:
+            out["delay_fa"] = "زنده (کمتر از یک دقیقه)"
+        elif age <= 20:
+            out["delay_fa"] = (f"{round(age)} دقیقه تأخیر — قانون بورس "
+                               f"شیکاگو برای داده رایگان")
+        else:
+            out["delay_fa"] = f"{round(age)} دقیقه — بازار بسته است"
 
     out["checked_at"] = _dt.datetime.now(_dt.timezone.utc)\
         .strftime("%Y-%m-%d %H:%M:%S UTC")

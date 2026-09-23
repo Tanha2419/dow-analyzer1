@@ -119,6 +119,8 @@ def api_dowcash():
             out = dcash.compare()
         elif what == "basis":
             out = dcash.compute_basis()
+        elif what == "freshest":
+            out = dcash.freshest()
         else:
             out = dcash.cash_price()
         return jsonify(web_api._clean(out))
