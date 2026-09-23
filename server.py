@@ -105,6 +105,27 @@ def api_spot():
         return jsonify(ok=False, error=str(e)), 500
 
 
+@app.route("/api/dowcash")
+def api_dowcash():
+    """قیمت نقدی داوجونز، منطبق با پلتفرم های معاملاتی.
+
+    وقتی بورس باز است ^DJI مستقیم؛ وقتی بسته است فیوچرز منهای
+    پایه زنده. همیشه با برچسب منبع.
+    """
+    import dow_cash as dcash
+    what = (request.args.get("what") or "price").lower()
+    try:
+        if what == "compare":
+            out = dcash.compare()
+        elif what == "basis":
+            out = dcash.compute_basis()
+        else:
+            out = dcash.cash_price()
+        return jsonify(web_api._clean(out))
+    except Exception as e:
+        return jsonify(dict(ok=False, error=str(e)[:200])), 200
+
+
 def _serve_ui(name, mime):
     """فایل ظاهر برنامه را از سه جا می گردد، به این ترتیب:
       ۱. پوشهٔ static/  (حالت عادی پروژه)
