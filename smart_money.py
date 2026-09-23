@@ -1134,6 +1134,24 @@ def run_full_smc(df: pd.DataFrame, interval: str = "1d",
                  htf_df: Optional[pd.DataFrame] = None,
                  intraday: Optional[pd.DataFrame] = None,
                  with_coalition: bool = True) -> Dict:
+    # سد نهایی: هر کندلی که قیمت ندارد (NaN) حذف می شود.
+    # یاهو برای روز جاری گاهی کندل ناقص می دهد — حجم دارد ولی
+    # قیمت ندارد — و همان یک ردیف کل تحلیل را می شکست.
+    _ohlc = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    if _ohlc:
+        _n0 = len(df)
+        df = df.dropna(subset=_ohlc, how="any")
+        if len(df) < _n0:
+            print(f"[تحلیل] {_n0 - len(df)} کندل ناقص نادیده گرفته شد")
+        if htf_df is not None and len(htf_df):
+            htf_df = htf_df.dropna(
+                subset=[c for c in _ohlc if c in htf_df.columns], how="any")
+        if intraday is not None and len(intraday):
+            intraday = intraday.dropna(
+                subset=[c for c in _ohlc if c in intraday.columns], how="any")
+    if len(df) < 10:
+        raise ValueError("داده کافی برای تحلیل نیست")
+
     left = right = 3 if interval != "1d" else 4
     struct = market_structure(df, left, right)
     fvgs = find_fvg(df)
