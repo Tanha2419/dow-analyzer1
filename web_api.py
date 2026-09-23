@@ -118,6 +118,18 @@ def fetch(interval: str = "1d", period: Optional[str] = None,
     df.index = pd.to_datetime(df.index)
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
+
+    # یاهو گاهی برای روز جاری کندل ناقص می فرستد: حجم دارد ولی
+    # قیمت هایش NaN است (مثلا پیش از باز شدن بازار). این کندل
+    # محاسبات پایین دست را می شکند، پس حذفش می کنیم.
+    ohlc = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    if ohlc:
+        before = len(df)
+        df = df.dropna(subset=ohlc, how="any")
+        if len(df) < before:
+            print(f"[داده] {before - len(df)} کندل ناقص حذف شد ({interval})")
+    if df.empty:
+        raise RuntimeError("پس از حذف کندل های ناقص داده ای نماند")
     return df
 
 

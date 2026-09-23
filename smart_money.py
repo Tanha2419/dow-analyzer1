@@ -314,9 +314,14 @@ def volume_profile(df: pd.DataFrame, bins: int = 64, lookback: int = 150) -> Dic
     HVN = گره تعادل و مقصد اصلاح قیمت | LVN = خلاء نقدینگی و مسیر حرکت سریع
     """
     d = df.tail(lookback)
+    # سد دفاعی: کندل های بدون قیمت (NaN) را کنار بگذار — یاهو گاهی
+    # برای روز جاری کندل ناقص می دهد و int(NaN) خطا می اندازد.
+    d = d.dropna(subset=[c for c in ("High", "Low", "Volume") if c in d.columns])
+    if len(d) < 2:
+        return {}
     lo = float(d["Low"].min())
     hi = float(d["High"].max())
-    if hi <= lo:
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         return {}
     edges = np.linspace(lo, hi, bins + 1)
     centers = (edges[:-1] + edges[1:]) / 2
