@@ -105,6 +105,102 @@ def api_spot():
         return jsonify(ok=False, error=str(e)), 500
 
 
+@app.route("/api/ask", methods=["GET", "POST"])
+def api_ask():
+    """پرسش و پاسخ قاعده محور — فقط از داده واقعی داشبورد."""
+    import qa_bot as qa
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            q = body.get("q") or body.get("question") or ""
+            a = body.get("asset") or _asset()
+            iv = body.get("interval") or "1d"
+        else:
+            q = request.args.get("q", "")
+            a = _asset()
+            iv = request.args.get("interval", "1d")
+
+        if (request.args.get("what") or "").lower() == "suggestions":
+            return jsonify(dict(ok=True, items=qa.suggestions()))
+
+        out = qa.ask(q, a, iv)
+        return jsonify(web_api._clean(out))
+    except Exception as e:
+        return jsonify(dict(ok=False, error=str(e)[:200])), 200
+
+
+@app.route("/api/quality")
+def api_quality():
+    """کیفیت سیگنال بر پایه آستانه های اثبات شده در بک تست."""
+    import signal_filter as sf
+    what = (request.args.get("what") or "assess").lower()
+    try:
+        if what == "evidence":
+            out = sf.evidence(request.args.get("asset"))
+        else:
+            a = _asset()
+            sc = request.args.get("score")
+            iv = request.args.get("interval", "1d")
+            if sc in (None, ""):
+                # امتیاز داده نشده → از خود ایجنت بگیر
+                import agent as _ag
+                d = _ag.decide(interval=iv, asset=a)
+                dec = d.get("decision") or {}
+                sc = dec.get("score", dec.get("raw_score", 0))
+            out = sf.assess(a, float(sc), iv)
+        return jsonify(web_api._clean(out))
+    except Exception as e:
+        return jsonify(dict(ok=False, error=str(e)[:200])), 200
+
+
+@app.route("/api/cross")
+def api_cross():
+    """همبستگی طلا ↔ داوجونز + محاسبه حجم معامله."""
+    import cross_asset as ca
+    what = (request.args.get("what") or "all").lower()
+    try:
+        if what == "size":
+            out = ca.position_size(
+                request.args.get("asset", "US30"),
+                float(request.args.get("entry", 0) or 0),
+                float(request.args.get("stop", 0) or 0),
+                float(request.args.get("equity", 10000) or 10000),
+                float(request.args.get("risk", 1.0) or 1.0))
+        elif what == "corr":
+            out = ca.correlation()
+        else:
+            def _d(k):
+                v = request.args.get(k)
+                try:
+                    return int(v) if v not in (None, "") else None
+                except Exception:
+                    return None
+            out = ca.build(_d("gold"), _d("dow"))
+        return jsonify(web_api._clean(out))
+    except Exception as e:
+        return jsonify(dict(ok=False, error=str(e)[:200])), 200
+
+
+@app.route("/api/enginetest")
+def api_enginetest():
+    """نتایج بک تست موتور — از فایل ذخیره شده، نه محاسبه زنده.
+
+    محاسبه زنده چند دقیقه طول می کشد و برای یک درخواست وب
+    مناسب نیست.
+    """
+    import json as _j
+    import os as _os
+    p = _os.path.join(app.root_path, "backtest_results.json")
+    if not _os.path.exists(p):
+        return jsonify(dict(ok=False,
+                            error="نتایج هنوز تولید نشده")), 200
+    try:
+        with open(p, encoding="utf-8") as f:
+            return jsonify(_j.load(f))
+    except Exception as e:
+        return jsonify(dict(ok=False, error=str(e)[:200])), 200
+
+
 @app.route("/api/dowcash")
 def api_dowcash():
     """قیمت نقدی داوجونز، منطبق با پلتفرم های معاملاتی.

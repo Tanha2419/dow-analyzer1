@@ -13,6 +13,7 @@ agent.py — ایجنت یکپارچه معاملاتی داوجونز
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import warnings
 from pathlib import Path
@@ -137,6 +138,44 @@ def _sig_from_parts(parts: List[tuple]) -> float:
     return float(sum(p[1] for p in parts))
 
 
+# اعتبار سیگنال بر حسب ساعت — هم راستا با tradeplan.VALID_HOURS
+_VALID_HOURS = {"5m": 2, "15m": 4, "30m": 6, "1h": 12, "1d": 72}
+_TEHRAN = _dt.timezone(_dt.timedelta(hours=3, minutes=30))
+
+
+def _signal_timing(interval: str, df) -> Dict:
+    """زمان صدور و مهلت اعتبار سیگنال — به وقت تهران.
+
+    قبلا فقط یک `generated` بدون منطقه زمانی وجود داشت و کاربر
+    نمی دانست سیگنال کی صادر شده و تا کی معتبر است.
+    """
+    now = _dt.datetime.now(_TEHRAN)
+    hours = _VALID_HOURS.get(interval, 12)
+    until = now + _dt.timedelta(hours=hours)
+
+    # زمان آخرین کندل بسته شده — مبنای واقعی تحلیل
+    bar_time = None
+    try:
+        ts = df.index[-1]
+        bar_time = str(ts)[:16]
+    except Exception:
+        pass
+
+    return dict(
+        issued_at=now.strftime("%Y-%m-%d %H:%M"),
+        issued_time=now.strftime("%H:%M"),
+        issued_tz="تهران",
+        valid_hours=hours,
+        valid_until=until.strftime("%Y-%m-%d %H:%M"),
+        valid_until_time=until.strftime("%H:%M"),
+        last_bar=bar_time,
+        timing_note=(f"این سیگنال ساعت {now:%H:%M} به وقت تهران صادر شد "
+                     f"و تا {until:%H:%M} روز {until:%Y-%m-%d} معتبر است "
+                     f"({hours} ساعت). بعد از آن باید دوباره بررسی شود "
+                     f"چون ساختار بازار عوض می شود."),
+    )
+
+
 def decide(interval: str = "1h", equity: float = 100_000,
            with_ml: bool = True, with_mtf: bool = True,
            with_coalition: bool = True, scale: bool = True,
@@ -197,7 +236,8 @@ def decide(interval: str = "1h", equity: float = 100_000,
             pass
 
     smc_res = smc.run_full_smc(df, interval, htf_df=htf, intraday=intraday,
-                               with_coalition=with_coalition)
+                               with_coalition=with_coalition,
+                               asset=prof["key"])
 
     price = float(df["Close"].iloc[-1])
     atr = float(smc.atr_array(df)[-1])
@@ -487,8 +527,13 @@ def decide(interval: str = "1h", equity: float = 100_000,
         bp = base["plan"]
         entry = float(bp["entry"])
         stop = float(bp["stop"])
+        smc_entry, smc_stop = entry, stop
+
         # اگر جهت ایجنت با جهت SMC مخالف است، از ساختار جاری بساز
-        if (direction > 0) != (entry > stop):
+        plan_source = "smc"
+        overridden = (direction > 0) != (entry > stop)
+        if overridden:
+            plan_source = "agent_override"
             if direction > 0:
                 entry, stop = price, price - 1.5 * atr
             else:
@@ -513,6 +558,34 @@ def decide(interval: str = "1h", equity: float = 100_000,
                 for kk, vv in tm.items()},
         )
 
+        # --- چرا این طرح با طرح پول هوشمند فرق دارد؟ ---
+        # دو موتور مستقل اند: SMC از ساختار بازار (سوییپ/بلوک) ورود
+        # می سازد، ایجنت همه لایه ها را جمع می زند. وقتی جهتشان
+        # مخالف شود، ایجنت طرح خودش را می سازد. تا امروز داشبورد
+        # نمی گفت کدام را دنبال کنید.
+        plan["source"] = plan_source
+        plan["is_primary"] = True
+        if overridden:
+            plan["source_fa"] = "🎯 طرح ایجنت (اصلی)"
+            plan["why_differs"] = (
+                f"موتور پول هوشمند جهت مخالف می دید (ورود "
+                f"{smc_entry * k:,.2f} / حد ضرر {smc_stop * k:,.2f}) ولی "
+                f"جمع بندی همه لایه ها جهت دیگری داد. چون ایجنت همه "
+                f"شواهد را با هم می سنجد، طرح او مبناست و ورود روی "
+                f"قیمت فعلی با حد ضرر ۱٫۵ برابر ATR گذاشته شد.")
+            plan["smc_alternative"] = dict(
+                entry=round(smc_entry * k, 4), stop=round(smc_stop * k, 4),
+                note="طرح موتور پول هوشمند — جهت مخالف، دنبال نکنید")
+        else:
+            plan["source_fa"] = "🎯 طرح ایجنت (هم راستا با پول هوشمند)"
+            plan["why_differs"] = (
+                "هر دو موتور هم جهت اند. ورود و حد ضرر از ساختار "
+                "بازار گرفته شده و هدف ها با نسبت ۲R تنظیم شده اند؛ "
+                "ممکن است اعداد هدف با بخش پول هوشمند کمی فرق کند "
+                "چون آنجا نسبت های خودش را می گذارد.")
+        plan["follow_this"] = ("این طرح را دنبال کنید — خروجی نهایی "
+                               "ایجنت است، نه یکی از لایه ها.")
+
     out = dict(
         meta=dict(symbol=sym, interval=interval,
                   asset=prof["key"], asset_name=prof["name"],
@@ -523,7 +596,8 @@ def decide(interval: str = "1h", equity: float = 100_000,
                   spot=(bas.get("spot") if bas.get("ok") else None),
                   basis=(bas or None),
                   atr=atr * k, equity=equity,
-                  generated=pd.Timestamp.now().isoformat()),
+                  generated=pd.Timestamp.now().isoformat(),
+                  **_signal_timing(interval, df)),
         decision=dict(direction=direction, label=label, grade=grade,
                       score=round(score, 2), raw_score=round(raw, 2),
                       confidence=round(conf, 1),

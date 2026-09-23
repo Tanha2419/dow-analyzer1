@@ -176,7 +176,7 @@ def build_plan(asset: str = "US30", interval: str = "1h",
         try:
             import smart_money as smc
             raw = agent_mod.load(interval, symbol=prof["candle_symbol"])
-            full = smc.run_full_smc(raw, interval)
+            full = smc.run_full_smc(raw, interval, asset=prof["key"])
             liq = full.get("liq") or {}
             vprof = full.get("vprof") or {}
             # تبدیل به مقیاس نمایشی

@@ -64,13 +64,19 @@ def _clean(v):
 
 
 # کلیدهایی که مقدارشان «قیمت» است و باید در ضریب مقیاس ضرب شوند
+_EXTRA_PRICE_KEYS = {
+    # قیمت رویدادهای HFT و سطوح شکست جعلی — باید مثل بقیه
+    # قیمت ها مقیاس بخورند وگرنه کنار هم بی معنی می شوند
+    "current_price", "reached", "closed", "overshoot",
+}
+
 _PRICE_KEYS = {
     "last", "high", "low", "open", "o", "h", "l", "c",
     "sma20", "sma50", "ema200", "atr", "vwap",
     "poc", "vah", "val", "near_hvn", "near_lvn",
     "top", "bottom", "level", "extreme", "price", "change",
     "entry", "stop", "tp1", "tp2", "tp3", "risk",
-}
+} | _EXTRA_PRICE_KEYS
 # کلیدهایی که لیستی از قیمت خام هستند
 _PRICE_LISTS = {"hvn", "lvn"}
 # کلیدهایی که هرگز نباید مقیاس بخورند (درصد، نسبت، امتیاز، حجم)
@@ -81,12 +87,20 @@ _SKIP_KEYS = {
 }
 
 
+# زیردرخت هایی که قیمتشان مال دارایی اصلی نیست و نباید مقیاس بخورد.
+# اعضای ائتلاف سهام مستقل اند (ویزا ~۳۶۰ دلار)؛ ضرب در ۱۰۰ عدد
+# بی معنی می ساخت.
+_NO_SCALE_SUBTREES = {"coalition", "members", "zone"}
+
+
 def scale_prices(obj, k: float = US30_SCALE):
     """همه مقادیر قیمتی را در ضریب مقیاس ضرب می کند (بازگشتی)."""
     if isinstance(obj, dict):
         out = {}
         for key, val in obj.items():
-            if key in _SKIP_KEYS:
+            if key in _NO_SCALE_SUBTREES:
+                out[key] = val
+            elif key in _SKIP_KEYS:
                 out[key] = val
             elif key in _PRICE_LISTS and isinstance(val, list):
                 out[key] = [None if v is None else round(v * k, 4) for v in val]
@@ -172,7 +186,8 @@ def build_payload(interval: str = "1d", bars: int = 160,
         pass
 
     res = smc.run_full_smc(df, interval, htf_df=htf_df, intraday=intraday,
-                           with_coalition=with_coalition)
+                           with_coalition=with_coalition,
+                           asset=prof["key"])
 
     n = len(df)
     off = n - min(bars, n)

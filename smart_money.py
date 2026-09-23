@@ -561,6 +561,22 @@ BANK_BASKET = ["GS", "JPM", "V", "AXP", "TRV", "XLF"]
 BANK_NAMES = {"GS": "گلدمن ساکس", "JPM": "جی پی مورگان", "V": "ویزا",
               "AXP": "امریکن اکسپرس", "TRV": "تراولرز", "XLF": "ETF بخش مالی"}
 
+# سبد ائتلاف طلا — سبد بالا برای طلا بی ربط بود (ویزا و تراولرز
+# ربطی به طلا ندارند). این سبد بازیگران واقعی بازار طلا را دارد:
+# معدن داران که اول حرکت می کنند، و خود صندوق های فلز.
+GOLD_BASKET = ["GDX", "GDXJ", "GLD", "SLV", "NEM", "AEM"]
+GOLD_NAMES = {"GDX": "ETF معدن داران بزرگ طلا",
+              "GDXJ": "ETF معدن داران کوچک طلا",
+              "GLD": "بزرگ ترین صندوق طلا",
+              "SLV": "صندوق نقره",
+              "NEM": "نیومانت (بزرگ ترین معدن دار)",
+              "AEM": "اگنیکو ایگل"}
+
+_BASKETS = {
+    "US30": (BANK_BASKET, BANK_NAMES, "XLF", "بانک ها و مالی داوجونز"),
+    "XAUUSD": (GOLD_BASKET, GOLD_NAMES, "GDX", "معدن داران و صندوق های طلا"),
+}
+
 
 def hft_footprint(df: pd.DataFrame, lookback: int = 120) -> Dict:
     """
@@ -591,6 +607,52 @@ def hft_footprint(df: pd.DataFrame, lookback: int = 120) -> Dict:
     hunt = ((np.nan_to_num(up_w) > 0.55) | (np.nan_to_num(dn_w) > 0.55)) & (vz > 0.8)
     hunt_rate = float(hunt.mean())
 
+    # --- قیمت دقیق هر رویداد ---
+    # قبلا فقط تعداد شمرده می شد و قیمت دور ریخته می شد. کاربر
+    # نمی توانست بفهمد «جذب ۴» یعنی در چه قیمتی. حالا هر رویداد با
+    # قیمت، زمان و فاصله اش از قیمت فعلی نگه داشته می شود.
+    idx_list = list(d.index)
+    now_px = float(c[-1])
+
+    def _ts(i):
+        try:
+            return str(idx_list[i])[:16]
+        except Exception:
+            return None
+
+    absorb_events: List[Dict] = []
+    for i in np.flatnonzero(burst):
+        i = int(i)
+        mid = float((h[i] + l[i]) / 2.0)
+        absorb_events.append(dict(
+            when=_ts(i), price=round(mid, 4),
+            high=round(float(h[i]), 4), low=round(float(l[i]), 4),
+            vol_z=round(float(vz[i]), 2),
+            dist_pct=round((mid - now_px) / now_px * 100, 3),
+            bars_ago=int(len(c) - 1 - i),
+            note="حجم سنگین بدون حرکت قیمت — دیوار سفارش",
+        ))
+
+    hunt_events: List[Dict] = []
+    for i in np.flatnonzero(hunt):
+        i = int(i)
+        up = float(np.nan_to_num(up_w)[i])
+        dn = float(np.nan_to_num(dn_w)[i])
+        if up >= dn:
+            lvl, side, fa = float(h[i]), "high", "شکار استاپ فروشندگان (سقف)"
+        else:
+            lvl, side, fa = float(l[i]), "low", "شکار استاپ خریداران (کف)"
+        hunt_events.append(dict(
+            when=_ts(i), price=round(lvl, 4), side=side,
+            wick_ratio=round(max(up, dn), 3),
+            vol_z=round(float(vz[i]), 2),
+            dist_pct=round((lvl - now_px) / now_px * 100, 3),
+            bars_ago=int(len(c) - 1 - i), note=fa,
+        ))
+
+    absorb_events.sort(key=lambda x: x["bars_ago"])
+    hunt_events.sort(key=lambda x: x["bars_ago"])
+
     ac1 = float(pd.Series(ret[1:]).autocorr(lag=1) or 0.0)
 
     step = 1.0 if c[-1] > 100 else 0.5
@@ -616,25 +678,87 @@ def hft_footprint(df: pd.DataFrame, lookback: int = 120) -> Dict:
     return dict(hft_index=idx, burst_rate=burst_rate, hunt_rate=hunt_rate,
                 autocorr=ac1, pin_rate=pin_rate, vol_of_vol=vol_of_vol,
                 regime=regime,
-                n_absorb=int(burst.sum()), n_hunt=int(hunt.sum()))
+                n_absorb=int(burst.sum()), n_hunt=int(hunt.sum()),
+                absorb_events=absorb_events[:12],
+                hunt_events=hunt_events[:12],
+                current_price=round(now_px, 4),
+                events_note=("قیمت هر رویداد ثبت شده است. فاصله بر حسب "
+                             "درصد نسبت به قیمت فعلی محاسبه می شود؛ "
+                             "عدد منفی یعنی پایین تر از قیمت فعلی."))
+
+
+def _accum_zone(d: pd.DataFrame, bars: int = 60) -> Optional[Dict]:
+    """محدوده قیمتی که بیشترین حجم در آن رد و بدل شده.
+
+    این همان جایی است که نهادها واقعا انباشت یا توزیع کرده اند —
+    نه یک تخمین، بلکه شمارش مستقیم حجم در هر باند قیمتی.
+    """
+    dd = d.tail(min(bars, len(d)))
+    if len(dd) < 15:
+        return None
+    hi = float(dd["High"].max())
+    lo = float(dd["Low"].min())
+    if not np.isfinite(hi) or not np.isfinite(lo) or hi <= lo:
+        return None
+
+    nb = 24
+    step = (hi - lo) / nb
+    prof = np.zeros(nb)
+    for _, row in dd.iterrows():
+        c = float(row["Close"])
+        v = float(row["Volume"]) if np.isfinite(row["Volume"]) else 0.0
+        b = int(min(nb - 1, max(0, (c - lo) / step)))
+        prof[b] += v
+
+    if prof.sum() <= 0:
+        return None
+
+    top = int(np.argmax(prof))
+    poc = lo + (top + 0.5) * step
+
+    # باندهایی که روی هم ۷۰٪ حجم را دارند = ناحیه ارزش
+    order = np.argsort(prof)[::-1]
+    acc, keep = 0.0, []
+    for b in order:
+        keep.append(int(b))
+        acc += prof[b]
+        if acc / prof.sum() >= 0.70:
+            break
+    val_lo = lo + min(keep) * step
+    val_hi = lo + (max(keep) + 1) * step
+
+    return dict(poc=round(poc, 4),
+                value_low=round(val_lo, 4),
+                value_high=round(val_hi, 4),
+                range_low=round(lo, 4), range_high=round(hi, 4),
+                bars=len(dd))
 
 
 def bank_coalition(interval: str = "1d", period: str = "6mo",
-                   ref: Optional[pd.DataFrame] = None) -> Dict:
+                   ref: Optional[pd.DataFrame] = None,
+                   asset: str = "US30") -> Dict:
     """
-    ائتلاف بانک ها: آیا سنگین وزن های مالی داوجونز هم جهت و با حجم غیرعادی
-    در حال انباشت یا توزیع هستند؟ هماهنگی بالا = جریان سفارش نهادی هماهنگ.
+    ائتلاف بازیگران بزرگ: آیا سنگین وزن ها هم جهت و با حجم غیرعادی
+    در حال انباشت یا توزیع هستند؟ هماهنگی بالا = جریان سفارش نهادی
+    هماهنگ.
+
+    سبد بر اساس دارایی انتخاب می شود — طلا با معدن داران سنجیده
+    می شود، نه با ویزا و تراولرز.
     """
     import yfinance as yf
+    basket, names, ref_sym, basket_fa = _BASKETS.get(
+        asset, _BASKETS["US30"])
+
     members: List[Dict] = []
     try:
-        raw = yf.download(BANK_BASKET, period=period, interval=interval,
+        raw = yf.download(basket, period=period, interval=interval,
                           group_by="ticker", progress=False, auto_adjust=True,
                           threads=True)
     except Exception as e:
-        return dict(ok=False, error=str(e), members=[], score=0.0, agreement=0.0)
+        return dict(ok=False, error=str(e), members=[], score=0.0,
+                    agreement=0.0, basket_fa=basket_fa)
 
-    for sym in BANK_BASKET:
+    for sym in basket:
         try:
             d = raw[sym].dropna() if isinstance(raw.columns, pd.MultiIndex) else raw.dropna()
             if len(d) < 30:
@@ -654,10 +778,23 @@ def bank_coalition(interval: str = "1d", period: str = "6mo",
             above = c[-1] > sma20
             strength = np.tanh(r10 / 3.0) * 0.5 + np.tanh(cd_norm * 8) * 0.35 + \
                        (0.15 if above else -0.15)
-            members.append(dict(symbol=sym, name=BANK_NAMES.get(sym, sym),
-                                ret_pct=float(r10), vol_z=float(vz[-1]),
-                                cd_slope=float(cd_norm), above_sma20=bool(above),
-                                strength=float(strength)))
+
+            # در چه قیمتی انباشت/توزیع کرده اند؟
+            zone = _accum_zone(d)
+            m = dict(symbol=sym, name=names.get(sym, sym),
+                     ret_pct=float(r10), vol_z=float(vz[-1]),
+                     cd_slope=float(cd_norm), above_sma20=bool(above),
+                     strength=float(strength),
+                     last_price=round(float(c[-1]), 4))
+            if zone:
+                m["zone"] = zone
+                m["action_fa"] = ("انباشت" if strength > 0.12 else
+                                  ("توزیع" if strength < -0.12 else "خنثی"))
+                m["zone_note"] = (
+                    f"بیشترین حجم حول {zone['poc']:,.2f} رد و بدل شده؛ "
+                    f"ناحیه فعالیت {zone['value_low']:,.2f} تا "
+                    f"{zone['value_high']:,.2f}")
+            members.append(m)
         except Exception:
             continue
 
@@ -674,7 +811,7 @@ def bank_coalition(interval: str = "1d", period: str = "6mo",
     if ref is not None and len(ref) > 40:
         try:
             rr = ref["Close"].pct_change().dropna().tail(60)
-            xlf = raw["XLF"]["Close"].pct_change().dropna().tail(60) \
+            xlf = raw[ref_sym]["Close"].pct_change().dropna().tail(60) \
                 if isinstance(raw.columns, pd.MultiIndex) else None
             if xlf is not None:
                 j = pd.concat([rr.reset_index(drop=True), xlf.reset_index(drop=True)],
@@ -683,18 +820,35 @@ def bank_coalition(interval: str = "1d", period: str = "6mo",
         except Exception:
             corr = None
 
+    who = "بانک ها" if asset == "US30" else "معدن داران طلا"
     if score > 0.18 and agreement >= 0.7:
-        verdict = "ائتلاف صعودی بانک ها (انباشت هماهنگ)"
+        verdict = f"ائتلاف صعودی {who} (انباشت هماهنگ)"
     elif score < -0.18 and agreement >= 0.7:
-        verdict = "ائتلاف نزولی بانک ها (توزیع هماهنگ)"
+        verdict = f"ائتلاف نزولی {who} (توزیع هماهنگ)"
     elif agreement < 0.6:
-        verdict = "بانک ها پراکنده و بدون هماهنگی (بی جهتی نهادی)"
+        verdict = f"{who} پراکنده و بدون هماهنگی (بی جهتی نهادی)"
     else:
         verdict = "ائتلاف ضعیف / در حال شکل گیری"
 
+    # ناحیه فعالیت مشترک — جایی که بیشتر اعضا در آن کار کرده اند
+    zones = [m["zone"] for m in members if m.get("zone")]
+    consensus = None
+    if zones:
+        consensus = dict(
+            members_with_zone=len(zones),
+            note=("هر عضو ناحیه قیمتی خودش را دارد چون قیمت هایشان "
+                  "متفاوت است؛ به ستون «ناحیه فعالیت» هر ردیف نگاه "
+                  "کنید."))
+
     return dict(ok=True, members=sorted(members, key=lambda m: -m["strength"]),
                 score=score, agreement=agreement, heavy_vol_share=heavy,
-                corr_xlf=corr, verdict=verdict)
+                corr_xlf=corr, verdict=verdict,
+                asset=asset, basket_fa=basket_fa,
+                basket=basket, ref_symbol=ref_sym,
+                consensus=consensus,
+                zone_note=("«ناحیه فعالیت» از شمارش مستقیم حجم در هر "
+                           "باند قیمتی ۶۰ کندل اخیر می آید — جایی که "
+                           "بیشترین معامله انجام شده."))
 
 
 # ============================================================================
@@ -728,11 +882,58 @@ def fake_trend_detector(df: pd.DataFrame, struct: Dict, flow: Dict,
     ph = pd.Series(h).rolling(w).max().shift(1).to_numpy()
     pl = pd.Series(l).rolling(w).min().shift(1).to_numpy()
     fake_breaks = 0
+    # سطح دقیق هر شکست جعلی — قبلا فقط شمرده می شد و قیمت
+    # دور ریخته می شد، پس کاربر نمی دانست کجا باید مراقب باشد.
+    fake_levels: List[Dict] = []
+    _idx = list(df.index)
+    _now = float(c[-1])
+
+    def _when(i):
+        try:
+            return str(_idx[i])[:16]
+        except Exception:
+            return None
+
     for i in range(max(w + 1, n - lookback), n):
         if not np.isnan(ph[i]) and h[i] > ph[i] and c[i] < ph[i]:
             fake_breaks += 1
+            fake_levels.append(dict(
+                when=_when(i), level=round(float(ph[i]), 4),
+                side="resistance", side_fa="مقاومت",
+                reached=round(float(h[i]), 4),
+                closed=round(float(c[i]), 4),
+                overshoot=round(float(h[i] - ph[i]), 4),
+                dist_pct=round((float(ph[i]) - _now) / _now * 100, 3),
+                bars_ago=int(n - 1 - i),
+                note="سقف شکسته شد ولی کندل زیر آن بسته شد — تله خرید",
+            ))
         if not np.isnan(pl[i]) and l[i] < pl[i] and c[i] > pl[i]:
             fake_breaks += 1
+            fake_levels.append(dict(
+                when=_when(i), level=round(float(pl[i]), 4),
+                side="support", side_fa="حمایت",
+                reached=round(float(l[i]), 4),
+                closed=round(float(c[i]), 4),
+                overshoot=round(float(pl[i] - l[i]), 4),
+                dist_pct=round((float(pl[i]) - _now) / _now * 100, 3),
+                bars_ago=int(n - 1 - i),
+                note="کف شکسته شد ولی کندل بالای آن بسته شد — تله فروش",
+            ))
+    fake_levels.sort(key=lambda x: x["bars_ago"])
+
+    # سطوحی که همین الان باید مراقبشان بود
+    watch: List[Dict] = []
+    if not np.isnan(ph[-1]):
+        watch.append(dict(level=round(float(ph[-1]), 4), side_fa="مقاومت",
+                          dist_pct=round((float(ph[-1]) - _now) / _now * 100, 3),
+                          note="اگر بالای این بزند ولی زیرش ببندد، "
+                               "شکست جعلی است"))
+    if not np.isnan(pl[-1]):
+        watch.append(dict(level=round(float(pl[-1]), 4), side_fa="حمایت",
+                          dist_pct=round((float(pl[-1]) - _now) / _now * 100, 3),
+                          note="اگر زیر این بزند ولی بالایش ببندد، "
+                               "شکست جعلی است"))
+
     if fake_breaks >= 3:
         score += 18
         reasons.append(f"{fake_breaks} شکست جعلی سطح در {lookback} کندل اخیر")
@@ -795,7 +996,13 @@ def fake_trend_detector(df: pd.DataFrame, struct: Dict, flow: Dict,
         verdict = "روند سالم و معتبر"
     return dict(score=score, verdict=verdict, reasons=reasons,
                 adx=float(adx[-1]), efficiency=float(eff),
-                fake_breaks=fake_breaks)
+                fake_breaks=fake_breaks,
+                fake_levels=fake_levels[:10],
+                watch_levels=watch,
+                current_price=round(_now, 4),
+                levels_note=("سطوح «مراقب باش» مرزهای ۲۰ کندل اخیرند. "
+                             "شکست جعلی وقتی رخ می دهد که قیمت از سطح "
+                             "رد شود ولی کندل داخل ببندد."))
 
 
 # ============================================================================
@@ -1133,7 +1340,8 @@ def causal_smc_signals(df: pd.DataFrame, left: int = 2, right: int = 2,
 def run_full_smc(df: pd.DataFrame, interval: str = "1d",
                  htf_df: Optional[pd.DataFrame] = None,
                  intraday: Optional[pd.DataFrame] = None,
-                 with_coalition: bool = True) -> Dict:
+                 with_coalition: bool = True,
+                 asset: str = "US30") -> Dict:
     # سد نهایی: هر کندلی که قیمت ندارد (NaN) حذف می شود.
     # یاهو برای روز جاری گاهی کندل ناقص می دهد — حجم دارد ولی
     # قیمت ندارد — و همان یک ردیف کل تحلیل را می شکست.
@@ -1168,7 +1376,8 @@ def run_full_smc(df: pd.DataFrame, interval: str = "1d",
     if htf_df is not None and len(htf_df) > 60:
         htf_bias = market_structure(htf_df, 4, 4)["bias"]
 
-    coalition = bank_coalition(interval="1d", period="6mo", ref=df) if with_coalition \
+    coalition = bank_coalition(interval="1d", period="6mo", ref=df,
+                               asset=asset) if with_coalition \
         else dict(ok=False, members=[], score=0.0, agreement=0.0)
 
     signal = build_master_signal(df, struct, fvgs, obs, liq, vprof, sweeps,
