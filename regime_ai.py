@@ -147,10 +147,27 @@ def detect_regime(df: pd.DataFrame, lookback: int = 220) -> Dict:
     efficiency = float(net / max(path, 1e-9))
 
     # امتیازدهی رژیم
+    # هر ورودی ممکن است NaN باشد (کندل ناقص، داده کم). NaN را خنثی
+    # می کنیم تا امتیاز نهایی همیشه عددی معتبر بماند.
+    def _num(x, default=0.0):
+        try:
+            f = float(x)
+            return f if np.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
+
+    H = _num(H, 0.5)
+    adx = _num(adx, 20.0)
+    efficiency = _num(efficiency, 0.25)
+    vol_ratio = _num(vol_ratio, 1.0)
+    k_slope = _num(k_slope, 0.0)
+    atr_pct = _num(atr_pct, 0.0)
+
     trend_s = 0.0
     trend_s += np.clip((H - 0.5) / 0.15, -1, 1) * 35
     trend_s += np.clip((adx - 20) / 15, -1, 1) * 30
     trend_s += np.clip((efficiency - 0.25) / 0.25, -1, 1) * 35
+    trend_s = _num(trend_s, 0.0)
     volatile = vol_ratio > 1.45
 
     if volatile and trend_s < 25:

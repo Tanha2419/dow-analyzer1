@@ -534,6 +534,26 @@ def api_autolog():
         return jsonify(ok=False, error=str(e)[:200]), 200
 
 
+@app.route("/api/extras")
+def api_extras():
+    """سه لایه کمکی: تایمر کیل زون، همبستگی دلار، شمارش معکوس فدرال رزرو."""
+    import macro_extras as mx
+    what = (request.args.get("what") or "all").lower()
+    asset = _asset()
+    try:
+        if what == "killzone":
+            out = mx.killzone_timer(asset)
+        elif what == "dxy":
+            out = mx.dxy_correlation(asset)
+        elif what == "fomc":
+            out = mx.fomc_countdown()
+        else:
+            out = mx.build_extras(asset)
+        return jsonify(web_api._clean(out))
+    except Exception as e:
+        return jsonify(dict(ok=False, error=str(e)[:200])), 200
+
+
 @app.route("/api/ping")
 def api_ping():
     """نقطه بیدارباش برای سرویس های پایش (UptimeRobot و مانند آن).

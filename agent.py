@@ -52,6 +52,17 @@ def load(interval: str = "1h", period: Optional[str] = None,
     df.index = pd.to_datetime(df.index)
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
+
+    # یاهو برای روز جاری کندل ناقص می دهد (حجم دارد، قیمت ندارد).
+    # همان یک ردیف محاسبات پایین دست را با NaN می شکند.
+    _o = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    if _o:
+        _n = len(df)
+        df = df.dropna(subset=_o, how="any")
+        if len(df) < _n:
+            print(f"[ایجنت] {_n - len(df)} کندل ناقص حذف شد ({interval})")
+    if df.empty:
+        raise RuntimeError("پس از حذف کندل های ناقص داده ای نماند")
     return df
 
 
