@@ -63,6 +63,10 @@ def headers(resp):
     # اجازه نمایش داخل iframe پیش نمایش
     resp.headers.pop("X-Frame-Options", None)
     resp.headers["Content-Security-Policy"] = "frame-ancestors *"
+    # هدرهای امنیتی پایه
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000"
     return resp
 
 
@@ -142,10 +146,19 @@ def api_quality():
             sc = request.args.get("score")
             iv = request.args.get("interval", "1d")
             if sc in (None, ""):
-                # امتیاز داده نشده → از خود ایجنت بگیر
-                import agent as _ag
-                d = _ag.decide(interval=iv, asset=a)
-                dec = d.get("decision") or {}
+                # امتیاز داده نشده → اول از انبار، بعد محاسبه زنده
+                dec = None
+                try:
+                    import snapshot as snap
+                    hit = snap.get(f"agent:{a}:{iv}")
+                    if hit and isinstance(hit["payload"], dict):
+                        dec = (hit["payload"].get("decision") or {})
+                except Exception:
+                    dec = None
+                if not dec:
+                    import agent as _ag
+                    d = _ag.decide(interval=iv, asset=a)
+                    dec = d.get("decision") or {}
                 sc = dec.get("score", dec.get("raw_score", 0))
             out = sf.assess(a, float(sc), iv)
         return jsonify(web_api._clean(out))
@@ -334,6 +347,35 @@ def api_backtest():
         return jsonify(ok=False, error=str(e)), 500
 
 
+@app.route("/api/snapshot", methods=["GET", "POST"])
+def api_snapshot():
+    """انبار نتیجه های از پیش محاسبه شده (گیت هاب اکشنز اینجا پوش می کند)."""
+    import snapshot as snap
+    if request.method == "GET":
+        return jsonify(snap.status())
+
+    if not snap.enabled():
+        return jsonify(ok=False,
+                       error="SNAPSHOT_KEY روی سرور تنظیم نشده"), 503
+    given = (request.headers.get("X-Snapshot-Key")
+             or request.args.get("key") or "")
+    if not snap.check_key(given):
+        return jsonify(ok=False, error="کلید نامعتبر"), 403
+
+    body = request.get_json(silent=True) or {}
+    items = body.get("items")
+    if not isinstance(items, dict) or not items:
+        return jsonify(ok=False, error="items خالی است"), 400
+
+    saved = []
+    for k, v in items.items():
+        if not isinstance(k, str) or len(k) > 80:
+            continue
+        snap.save(k, v, built_at=body.get("built_at"))
+        saved.append(k)
+    return jsonify(ok=True, saved=saved, count=len(saved))
+
+
 @app.route("/api/agent")
 def api_agent():
     interval = request.args.get("interval", "1h")
@@ -344,6 +386,26 @@ def api_agent():
     with_ml = request.args.get("ml", "1") != "0"
     with_mtf = request.args.get("mtf", "1") != "0"
     log = request.args.get("log", "0") == "1"
+
+    # ── اول انبار: اگر نتیجه تازه ای هست، فوری بده (زیر یک ثانیه) ──
+    # با ?fresh=1 می توان محاسبه زنده را اجبار کرد.
+    if request.args.get("fresh", "0") != "1" and not log:
+        try:
+            import snapshot as snap
+            hit = snap.get(f"agent:{_asset()}:{interval}")
+            if hit and isinstance(hit["payload"], dict):
+                d = dict(hit["payload"])
+                d["_snapshot"] = {
+                    "from_cache": True,
+                    "age_sec": round(hit["age"], 1),
+                    "age_fa": snap._age_fa(hit["age"]),
+                    "note": "نتیجه از پیش محاسبه شده — برای محاسبه زنده "
+                            "«fresh=1» را به آدرس اضافه کنید",
+                }
+                return jsonify(ok=True, data=d)
+        except Exception:
+            pass                      # انبار خراب بود → محاسبه زنده
+
     try:
         d = agent_mod.decide(interval=interval, equity=equity, with_ml=with_ml,
                              with_mtf=with_mtf, with_coalition=True, scale=scale,
