@@ -516,19 +516,38 @@ def api_live():
         return jsonify(ok=False, error=str(e)), 500
 
 
+# شمارنده اتصال های زنده باز — جلوی قفل شدن همه نخ ها را می گیرد
+_STREAMS = {"n": 0}
+
+
 @app.route("/api/live/stream")
 def api_live_stream():
     """جریان Server-Sent Events — قیمت به محض تغییر push می شود."""
     scale = request.args.get("scale", "1") != "0"
     feed = live_feed.get_feed(_asset())
 
+    # ⚠️ چرا سقف زمانی لازم است؟
+    # هر اتصال SSE یک «نخ» گانیکورن را تا وقتی تب مرورگر باز است نگه
+    # می دارد. با --threads 4 کافی است ۴ تب باز باشد تا کل سایت قفل شود
+    # و حتی فایل استاتیک هم جواب ندهد. مرورگر با EventSource خودش بعد از
+    # بسته شدن دوباره وصل می شود، پس بستن دوره ای کاملا بی دردسر است.
+    MAX_STREAM_SEC = 240
+    MAX_STREAMS = 6
+
     def gen():
+        if _STREAMS["n"] >= MAX_STREAMS:
+            yield ("event: busy\ndata: "
+                   '{"msg":"ظرفیت جریان زنده پر است — از حالت معمولی استفاده کنید"}'
+                   "\n\n")
+            return
+        _STREAMS["n"] += 1
+        started = _time.time()
         q = feed.subscribe()
         try:
             snap = feed.snapshot(scale=scale)
             yield f"event: snapshot\ndata: {_json.dumps(snap, ensure_ascii=False)}\n\n"
             last_beat = _time.time()
-            while True:
+            while _time.time() - started < MAX_STREAM_SEC:
                 sent = False
                 while q:
                     q.popleft()
@@ -546,6 +565,7 @@ def api_live_stream():
             pass
         finally:
             feed.unsubscribe(q)
+            _STREAMS["n"] = max(0, _STREAMS["n"] - 1)
 
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
