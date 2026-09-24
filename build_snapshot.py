@@ -5,7 +5,7 @@ CPU کامل هست، پس محاسبه ای که روی Render رایگان ۱�
 اینجا چند ثانیه است. نتیجه با یک POST امن به سایت فرستاده می شود.
 
 متغیرهای لازم:
-    SITE_URL      آدرس سایت، مثل https://dow-analyzer1.onrender.com
+    SITE_URL      آدرس سایت، مثل https://YOUR-SITE.onrender.com
     SNAPSHOT_KEY  همان کلید مشترکی که روی Render تنظیم شده
 
 اجرای دستی برای تست:
@@ -67,7 +67,8 @@ def push(items: dict, built_at: float) -> bool:
             if e.code in (403, 503):
                 return False             # کلید غلط یا تنظیم نشده → تکرار بی فایده
         except Exception as e:
-            print(f"  تلاش {attempt + 1}: {type(e).__name__} — {str(e)[:120]}")
+            msg = str(e)[:120].replace(SITE, "[سایت]") if SITE else str(e)[:120]
+            print(f"  تلاش {attempt + 1}: {type(e).__name__} — {msg}")
         time.sleep(10 * (attempt + 1))
     return False
 
@@ -77,7 +78,10 @@ def main() -> int:
         print("❌ SITE_URL یا SNAPSHOT_KEY تنظیم نشده")
         return 1
 
-    print(f"سایت هدف: {SITE}")
+    # آدرس را عمدا چاپ نمی کنیم: در ریپوی پابلیک لاگ اجراها عمومی است و
+    # ماسک خودکار گیت هاب فقط روی مقدار دقیق Secret کار می کند — اگر کاربر
+    # آدرس را با / انتها ذخیره کرده باشد، rstrip بالا ماسک را بی اثر می کند.
+    print(f"سایت هدف: تنظیم شد ({len(SITE)} کاراکتر) ✅")
     items, ok_count = {}, 0
     t_all = time.time()
 
