@@ -1,0 +1,39 @@
+name: محاسبه و ارسال نتیجه به داشبورد
+
+on:
+  schedule:
+    # هر ۱۵ دقیقه. کرون گیت هاب گاهی تا ۱۵ دقیقه تاخیر دارد — طبیعی است.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # دکمه اجرای دستی در تب Actions
+
+# اگر اجرای قبلی تمام نشده، اجرای جدید صبر نکند و قبلی لغو شود
+concurrency:
+  group: snapshot
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: گرفتن کد
+        uses: actions/checkout@v4
+
+      - name: نصب پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: نصب کتابخانه ها
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: محاسبه و ارسال
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          SNAPSHOT_KEY: ${{ secrets.SNAPSHOT_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python build_snapshot.py
