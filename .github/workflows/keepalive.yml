@@ -1,0 +1,29 @@
+name: زنده نگه داشتن زمان بندی
+
+# ⚠️ چرا این فایل لازم است؟
+# گیت هاب در ریپوی «پابلیک» زمان بندی را بعد از ۶۰ روز بی فعالیتی
+# بی سر و صدا خاموش می کند. این ورک فلو ماهی یک بار یک کامیت
+# بی ضرر می زند تا ساعت ۶۰ روزه صفر شود.
+# عبارت [skip render] جلوی دیپلوی مجدد Render را می گیرد.
+
+on:
+  schedule:
+    - cron: "17 5 1 * *"        # اول هر ماه، ساعت ۰۵:۱۷ UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: زدن مهر زمان
+        run: |
+          date -u +"%Y-%m-%d %H:%M UTC" > .github/last-keepalive.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-keepalive.txt
+          git commit -m "زنده نگه داشتن زمان بندی [skip render]" || exit 0
+          git push
