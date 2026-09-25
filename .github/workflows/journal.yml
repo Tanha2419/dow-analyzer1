@@ -1,0 +1,92 @@
+name: ثبت و ارزیابی سیگنال ها
+
+# ─────────────────────────────────────────────────────────────────────
+#  چرا این ورک فلو وجود دارد
+#  ─────────────────────────
+#  دفترچه سیگنال روی Render رایگان با هر ری استارت پاک می شد، پس آمار
+#  هیچ وقت به ۱۰۰ نمونه لازم نمی رسید. اینجا ریپو نقش انبار دائمی را
+#  بازی می کند: هر اجرا دفترچه را می خواند، سیگنال تازه ثبت می کند،
+#  سیگنال های سررسید شده را ارزیابی می کند و فایل را کامیت می کند.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # ساعت ها UTC است. تهران = UTC + ۳:۳۰
+    #
+    # دقیقه ۵ و ۳۵ عمدی است: ورک فلو snapshot روی */15 اجرا می شود
+    # (۰۰، ۱۵، ۳۰، ۴۵). این فاصله باعث می شود دو ورک فلو همزمان به
+    # یاهو فایننس درخواست نزنند و به محدودیت نرخ نخورند.
+    #
+    # ۰۶ تا ۲۲ UTC، دوشنبه تا جمعه = کل سشن لندن + نیویورک با حاشیه.
+    # آخر هفته خاموش چون بازار بسته است و نمونه بی معنا تولید می شود.
+    - cron: "5,35 6-22 * * 1-5"
+  workflow_dispatch:        # دکمه اجرای دستی در تب Actions
+
+# اجازه نوشتن لازم است چون دفترچه در ریپو کامیت می شود
+permissions:
+  contents: write
+
+# دو اجرای همزمان = تعارض در گیت. اجرای جدید صبر می کند تا قبلی تمام شود.
+# برخلاف snapshot اینجا cancel-in-progress نداریم: نصفه رها کردن یک اجرا
+# ممکن است کامیت را از دست بدهد.
+concurrency:
+  group: journal
+  cancel-in-progress: false
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: گرفتن کد
+        uses: actions/checkout@v4
+        with:
+          # تاریخچه کامل لازم است: مرحله آخر git pull --rebase می زند
+          # و روی کلون سطحی (پیش فرض depth=1) شکست می خورد
+          fetch-depth: 0
+
+      - name: نصب پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: نصب کتابخانه ها
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: ثبت، ارزیابی و پوش
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          SNAPSHOT_KEY: ${{ secrets.SNAPSHOT_KEY }}
+          # اگر سایت تک دارایی دارید اینها را عوض کنید، مثلا XAUUSD
+          JOURNAL_ASSETS: "US30,XAUUSD"
+          # فقط ۱d چون تنها تایم فریمی است که در تحقیق اعتبارسنجی شد.
+          # برای جمع شدن سریع تر نمونه می توانید "1d,1h" بگذارید.
+          JOURNAL_INTERVALS: "1d"
+          PYTHONUNBUFFERED: "1"
+        run: python build_journal.py
+
+      - name: کامیت دفترچه در ریپو
+        run: |
+          if [ ! -f journal.jsonl ]; then
+            echo "دفترچه ساخته نشد — چیزی برای کامیت نیست"
+            exit 0
+          fi
+          git config user.name  "journal-bot"
+          git config user.email "journal-bot@users.noreply.github.com"
+          git add -f journal.jsonl
+          if git diff --cached --quiet; then
+            echo "تغییری نبود — کامیت لازم نیست"
+            exit 0
+          fi
+          N=$(wc -l < journal.jsonl | tr -d ' ')
+          # [skip render] جلوی ری دیپلوی خودکار Render را می گیرد،
+          # وگرنه روزی ۳۳ بار سایت ری استارت می شد و دقیقا همان
+          # پاک شدن دفترچه ای که می خواهیم حلش کنیم دوباره رخ می داد.
+          git commit -m "ثبت خودکار سیگنال — ${N} رکورد [skip render]"
+          # اگر اجرای موازی چیزی کامیت کرده، اول آن را بردار
+          git pull --rebase --autostash origin ${GITHUB_REF_NAME} || true
+          git push
