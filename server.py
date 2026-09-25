@@ -70,8 +70,27 @@ def headers(resp):
     return resp
 
 
+# ============================================================ قفل دارایی
+# اگر این متغیر ست شود (XAUUSD یا US30) سایت فقط همان یک دارایی را نشان
+# می دهد و سوییچ بالای صفحه پنهان می شود. برای وقتی که می خواهید طلا و
+# داوجونز دو سایت جدا باشند — با همین یک کد، بدون دوتا کردن پروژه.
+LOCK_ASSET = (os.environ.get("LOCK_ASSET") or "").strip().upper()
+if LOCK_ASSET not in ("US30", "XAUUSD"):
+    LOCK_ASSET = ""
+
+_LOCK_TITLES = {"US30": "داشبورد پول هوشمند داوجونز",
+                "XAUUSD": "داشبورد پول هوشمند طلا"}
+
+_LOCK_SNIPPET = ("<style>#assetSw{display:none !important}</style>"
+                 "<script>try{localStorage.setItem('dj_asset','%s');}"
+                 "catch(e){}</script>") % LOCK_ASSET if LOCK_ASSET else ""
+
+
 def _asset() -> str:
-    """کلید دارایی از پارامتر ?asset= (پیش فرض داوجونز)."""
+    """کلید دارایی از پارامتر ?asset= (پیش فرض داوجونز).
+    اگر LOCK_ASSET ست باشد، پارامتر نادیده گرفته می شود."""
+    if LOCK_ASSET:
+        return assets_mod.resolve(LOCK_ASSET)
     return assets_mod.resolve(request.args.get("asset"))
 
 
@@ -242,16 +261,29 @@ def _serve_ui(name, mime):
       ۱. پوشهٔ static/  (حالت عادی پروژه)
       ۲. کنار خود server.py  (اگر کاربر بدون پوشه آپلود کرده باشد)
       ۳. نسخهٔ جاسازی شده داخل همین فایل  (تک فایلی)
-    با این کار استقرار حتی اگر هیچ فایل جانبی آپلود نشود هم کار می کند."""
+    با این کار استقرار حتی اگر هیچ فایل جانبی آپلود نشود هم کار می کند.
+
+    اگر LOCK_ASSET ست شده باشد (سایت تک دارایی)، یک تکه کوچک به صفحه
+    تزریق می شود که سوییچ دارایی را پنهان و دارایی را قفل می کند."""
+    body = None
     for folder in ("static", ""):
         d = os.path.join(app.root_path, folder) if folder else app.root_path
-        if os.path.exists(os.path.join(d, name)):
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            if LOCK_ASSET and mime == "text/html":
+                with open(p, "r", encoding="utf-8") as fh:
+                    body = fh.read()
+                break
             return send_from_directory(d, name, mimetype=mime)
-    if _embedded is not None:
+    if body is None and _embedded is not None:
         blob = _embedded.get(name)
         if blob:
-            return Response(blob, mimetype=mime)
-    return None
+            body = blob if isinstance(blob, str) else blob.decode("utf-8", "ignore")
+    if body is None:
+        return None
+    if LOCK_ASSET and mime == "text/html":
+        body = body.replace("</head>", _LOCK_SNIPPET + "</head>", 1)
+    return Response(body, mimetype=mime)
 
 
 def _ui_source(name):
@@ -367,13 +399,27 @@ def api_snapshot():
     if not isinstance(items, dict) or not items:
         return jsonify(ok=False, error="items خالی است"), 400
 
-    saved = []
+    saved, merged = [], None
     for k, v in items.items():
         if not isinstance(k, str) or len(k) > 80:
             continue
+        # ── دفترچه سیگنال: به جای انبار موقت، مستقیم در فایل ادغام شود ──
+        # چرا؟ تا همه مسیرهای موجود (summary، autolog، کارت کارنامه)
+        # بدون تغییر کار کنند. اکشنز منبع حقیقت است و بعد از هر
+        # ری استارت Render نسخه کامل را برمی گرداند.
+        if k == "journal:rows" and isinstance(v, list):
+            try:
+                import journal as jr
+                merged = jr.merge(v)
+            except Exception as e:
+                merged = dict(ok=False, error=str(e)[:150])
+            continue
         snap.save(k, v, built_at=body.get("built_at"))
         saved.append(k)
-    return jsonify(ok=True, saved=saved, count=len(saved))
+    out = dict(ok=True, saved=saved, count=len(saved))
+    if merged is not None:
+        out["journal"] = merged
+    return jsonify(out)
 
 
 @app.route("/api/agent")
@@ -431,6 +477,16 @@ def api_journal():
     asset = request.args.get("asset") or None
     try:
         import journal as jr
+        # صادرات خام برای گیت هاب اکشنز — قبل از اینکه ری استارت
+        # بعدی Render رکوردهای ثبت شده روی سایت را پاک کند.
+        if what == "export":
+            import snapshot as snap
+            given = (request.headers.get("X-Snapshot-Key")
+                     or request.args.get("key") or "")
+            if not snap.check_key(given):
+                return jsonify(ok=False, error="کلید نامعتبر"), 403
+            rows = jr.load_rows()
+            return jsonify(ok=True, n=len(rows), rows=rows)
         if what == "dist":
             return jsonify(ok=True, data=agent_mod.journal_stats())
         if what == "summary":
@@ -730,7 +786,34 @@ def api_autolog():
             autolog.start()
         elif act == "stop":
             autolog.stop()
-        return jsonify(ok=True, data=web_api._clean(autolog.status()))
+        st = autolog.status()
+        # ── منبع بیرونی: گیت هاب اکشنز ──
+        # از ۲۰۲۶-۰۹-۲۴ ثبت و ارزیابی روی اکشنز انجام می شود، نه در
+        # این پروسه. نخ داخلی خاموش است و باید هم خاموش بماند (دیسک
+        # Render موقتی است). پس وضعیت واقعی را از تازگی آخرین پوش
+        # اکشنز می خوانیم، نه از زنده بودن نخ.
+        try:
+            import snapshot as snap
+            age = snap.age_of("journal:summary")
+            if age is not None:
+                st["external"] = dict(
+                    source="گیت هاب اکشنز",
+                    age_sec=round(age, 1),
+                    age_fa=snap._age_fa(age),
+                    # هر ۳۰ دقیقه اجرا می شود؛ ۹۰ دقیقه = دو نوبت از دست رفته
+                    alive=bool(age < 5400),
+                    note="ثبت و ارزیابی روی گیت هاب اکشنز انجام می شود و "
+                         "دفترچه در ریپو نگهداری می شود — با ری استارت "
+                         "سایت پاک نمی شود")
+            else:
+                st["external"] = dict(
+                    source="گیت هاب اکشنز", alive=False, age_sec=None,
+                    note="هنوز چیزی از اکشنز نرسیده — اگر تازه راه اندازی "
+                         "کرده اید، تا اولین اجرای زمان بندی شده صبر کنید "
+                         "یا در تب Actions دکمه Run workflow را بزنید")
+        except Exception:
+            pass
+        return jsonify(ok=True, data=web_api._clean(st))
     except Exception as e:
         return jsonify(ok=False, error=str(e)[:200]), 200
 

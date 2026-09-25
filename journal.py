@@ -21,7 +21,14 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-PATH = os.path.join(BASE, "journal.jsonl")
+
+# مسیر دفترچه. روی Render رایگان دیسک موقتی است و با هر ری استارت
+# پاک می شود، برای همین منبع حقیقت در ریپوی گیت هاب نگه داشته می شود
+# و اکشنز نسخه کامل را دوباره به سایت پوش می کند (merge پایین همین فایل).
+PATH = os.environ.get("JOURNAL_PATH") or os.path.join(BASE, "journal.jsonl")
+
+# سقف نگهداری رکورد — جلوگیری از رشد بی انتهای فایل و بدنه POST
+MAX_ROWS = int(os.environ.get("JOURNAL_MAX_ROWS", "5000"))
 
 # چند کندل جلوتر را برای ارزیابی نگاه کنیم
 HORIZON = {"5m": 12, "15m": 8, "30m": 6, "1h": 8, "1d": 5}
@@ -120,6 +127,76 @@ def _save(rows: List[Dict]):
     with io.open(PATH, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  همگام سازی با انبار دائمی (ریپوی گیت هاب)
+# ─────────────────────────────────────────────────────────────────────
+
+def load_rows() -> List[Dict]:
+    """همه رکوردها — برای صادر کردن به گیت هاب اکشنز."""
+    return _load()
+
+
+def _better(a: Dict, b: Dict) -> Dict:
+    """از دو نسخه یک رکورد، کامل ترش را نگه دار.
+
+    قاعده ها به ترتیب اولویت:
+      ۱. رکورد ارزیابی شده همیشه برنده است (نتیجه واقعی دارد)
+      ۲. اگر هر دو یکسان اند، آنکه بیشتر به روز شده
+      ۳. قیمت و زمانِ ورودِ اولین ثبت همیشه حفظ می شود
+    """
+    ca, cb = bool(a.get("checked")), bool(b.get("checked"))
+    if ca != cb:
+        win, lose = (a, b) if ca else (b, a)
+    elif int(a.get("updates") or 1) >= int(b.get("updates") or 1):
+        win, lose = a, b
+    else:
+        win, lose = b, a
+    out = dict(win)
+    out["updates"] = max(int(a.get("updates") or 1), int(b.get("updates") or 1))
+    # ورود اصلی نباید جابجا شود وگرنه R محاسبه شده بی معنا می شود
+    try:
+        if str(lose.get("ts") or "") and str(lose.get("ts")) < str(out.get("ts") or "~"):
+            out["ts"] = lose["ts"]
+            out["price"] = lose["price"]
+    except Exception:
+        pass
+    return out
+
+
+def merge(incoming: List[Dict]) -> Dict:
+    """رکوردهای بیرونی را با دفترچه محلی ادغام می کند.
+
+    دو طرفه است: هم اکشنز چیزی که سایت ثبت کرده را برمی دارد،
+    هم سایت بعد از ری استارت نسخه کامل را از اکشنز پس می گیرد.
+    هیچ رکورد ارزیابی شده ای با نسخه خام بازنویسی نمی شود.
+    """
+    if not isinstance(incoming, list):
+        return dict(ok=False, error="ورودی باید فهرست باشد")
+    cur = {r.get("id"): r for r in _load() if isinstance(r, dict) and r.get("id")}
+    before = len(cur)
+    added = updated = 0
+    for r in incoming:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("id")
+        if not rid:
+            continue
+        if rid in cur:
+            m = _better(cur[rid], r)
+            if m != cur[rid]:
+                cur[rid] = m
+                updated += 1
+        else:
+            cur[rid] = r
+            added += 1
+    rows = sorted(cur.values(), key=lambda x: str(x.get("ts") or ""))
+    if len(rows) > MAX_ROWS:              # قدیمی ترین ها حذف می شوند
+        rows = rows[-MAX_ROWS:]
+    _save(rows)
+    return dict(ok=True, before=before, after=len(rows),
+                added=added, updated=updated)
 
 
 def evaluate(limit: int = 500) -> Dict:
@@ -231,9 +308,13 @@ def summary(asset: Optional[str] = None) -> Dict:
     rs = [r["outcome"]["r_mult"] for r in rows]
     wins = [x for x in rs if x > 0]
     by_asset = {}
+    by_iv = {}
     for r in rows:
         a = r["asset"]
         by_asset.setdefault(a, []).append(r["outcome"]["r_mult"])
+        # تفکیک تایم فریم لازم است: قاطی کردن D1 و H1 در یک نرخ برد
+        # گمراه کننده است چون تحقیق نشان داد فقط D1 اعتبار دارد
+        by_iv.setdefault(r.get("interval") or "?", []).append(r["outcome"]["r_mult"])
 
     # اثر هر بخش: میانگین R وقتی آن بخش فعال و هم جهت بوده
     contrib = {}
@@ -267,8 +348,17 @@ def summary(asset: Optional[str] = None) -> Dict:
         by_asset={k: dict(n=len(v), avg_r=round(sum(v) / len(v), 3),
                           win_rate=round(100.0 * len([x for x in v if x > 0]) / len(v), 1))
                   for k, v in by_asset.items()},
+        by_interval={k: dict(n=len(v), avg_r=round(sum(v) / len(v), 3),
+                             win_rate=round(100.0 * len([x for x in v if x > 0]) / len(v), 1),
+                             enough=len(v) >= 100)
+                     for k, v in sorted(by_iv.items())},
         parts=parts_stat[:15],
         source_tier="real",
+        enough_samples=len(rows) >= 100,
+        power_note=("نمونه کافی است" if len(rows) >= 100 else
+                    "⚠️ فقط %d نمونه — تا زیر ۱۰۰ نرسیده این اعداد "
+                    "آماری معنادار نیستند و نباید مبنای پول واقعی باشند"
+                    % len(rows)),
         note="بر پایه %d سیگنال ارزیابی شده از %d ثبت شده" % (len(rows), total))
 
 
