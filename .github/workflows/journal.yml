@@ -71,22 +71,54 @@ jobs:
 
       - name: کامیت دفترچه در ریپو
         run: |
+          set -u
           if [ ! -f journal.jsonl ]; then
-            echo "دفترچه ساخته نشد — چیزی برای کامیت نیست"
+            echo "::warning::دفترچه ساخته نشد — چیزی برای کامیت نیست"
             exit 0
           fi
+
           git config user.name  "journal-bot"
           git config user.email "journal-bot@users.noreply.github.com"
+
+          # -f لازم است چون journal.jsonl در .gitignore بوده
           git add -f journal.jsonl
           if git diff --cached --quiet; then
             echo "تغییری نبود — کامیت لازم نیست"
             exit 0
           fi
+
           N=$(wc -l < journal.jsonl | tr -d ' ')
-          # [skip render] جلوی ری دیپلوی خودکار Render را می گیرد،
-          # وگرنه روزی ۳۳ بار سایت ری استارت می شد و دقیقا همان
-          # پاک شدن دفترچه ای که می خواهیم حلش کنیم دوباره رخ می داد.
+          # [skip render] جلوی ری دیپلوی خودکار Render را می گیرد، وگرنه
+          # روزی ۳۳ بار سایت ری استارت می شد و دقیقا همان پاک شدن
+          # دفترچه ای که می خواهیم حلش کنیم دوباره رخ می داد.
           git commit -m "ثبت خودکار سیگنال — ${N} رکورد [skip render]"
-          # اگر اجرای موازی چیزی کامیت کرده، اول آن را بردار
-          git pull --rebase --autostash origin ${GITHUB_REF_NAME} || true
-          git push
+
+          BR="${GITHUB_REF_NAME}"
+
+          # سه تلاش: اگر اجرای موازی همزمان پوش کرده باشد، ریبیس
+          # می کنیم و دوباره امتحان.
+          for i in 1 2 3; do
+            git fetch -q origin "$BR" || true
+            if ! git rebase "origin/$BR"; then
+              echo "ریبیس نشد — لغو و تلاش دوباره"
+              git rebase --abort || true
+            fi
+
+            # ⚠ مسیر صریح لازم است. «git push» خالی روی رانر با خطای
+            # «current branch has no upstream branch» شکست می خورد،
+            # چون actions/checkout همیشه ردیابی برنچ را تنظیم نمی کند.
+            if git push origin "HEAD:refs/heads/$BR"; then
+              echo "✅ دفترچه با ${N} رکورد در ریپو ذخیره شد"
+              exit 0
+            fi
+
+            echo "تلاش $i ناموفق بود — ۵ ثانیه صبر"
+            sleep 5
+          done
+
+          echo "::error::پوش دفترچه ناموفق ماند."
+          echo ""
+          echo "محتمل ترین علت، نداشتن اجازه نوشتن است:"
+          echo "  Settings → Actions → General → Workflow permissions"
+          echo "  گزینه «Read and write permissions» را انتخاب و Save کنید."
+          exit 1
