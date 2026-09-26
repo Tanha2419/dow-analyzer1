@@ -143,6 +143,44 @@ _VALID_HOURS = {"5m": 2, "15m": 4, "30m": 6, "1h": 12, "1d": 72}
 _TEHRAN = _dt.timezone(_dt.timedelta(hours=3, minutes=30))
 
 
+# ── اصلاح ۲۰۲۶-۰۹-۲۵: مقیاس نشدن پنل چند تایم فریمی ──────────
+# ctx خام از market_context می آید و مستقیم داخل خروجی گذاشته
+# می شد، بدون اینکه ضریب نمایش k روی آن اعمال شود. نتیجه: پنل
+# MTF برای داوجونز عدد دلاری دیا نشان می داد (۵۱۷ به جای ۵۱٬۷۴۷).
+#
+# فقط زیردرخت mtf اصلاح می شود. intermarket دست نخورده می ماند
+# چون قیمت دارایی های دیگر (دلار، طلا، بازده) را دارد و ضرب آنها
+# در ۱۰۰ عدد بی معنی می سازد.
+_MTF_PRICE_KEYS = {"price", "atr", "level", "high", "low", "open", "close"}
+
+
+def _scale_mtf(node, k: float):
+    """ضریب نمایش را فقط روی کلیدهای قیمتی زیردرخت mtf اعمال می کند."""
+    if k == 1.0:
+        return node
+    if isinstance(node, dict):
+        out = {}
+        for key, val in node.items():
+            if key in _MTF_PRICE_KEYS and isinstance(val, (int, float)) \
+                    and not isinstance(val, bool):
+                out[key] = round(float(val) * k, 4)
+            else:
+                out[key] = _scale_mtf(val, k)
+        return out
+    if isinstance(node, list):
+        return [_scale_mtf(x, k) for x in node]
+    return node
+
+
+def _scale_mtf_ctx(ctx: Dict, k: float) -> Dict:
+    """کپی سطحی از ctx با زیردرخت mtf مقیاس خورده."""
+    if not isinstance(ctx, dict) or k == 1.0 or "mtf" not in ctx:
+        return ctx
+    out = dict(ctx)
+    out["mtf"] = _scale_mtf(ctx.get("mtf"), k)
+    return out
+
+
 def _signal_timing(interval: str, df) -> Dict:
     """زمان صدور و مهلت اعتبار سیگنال — به وقت تهران.
 
@@ -605,7 +643,7 @@ def decide(interval: str = "1h", equity: float = 100_000,
                                      session=round(ses_k, 3), regime=round(reg_k, 3))),
         parts=[dict(name=p[0], weight=round(p[1], 2), detail=p[2]) for p in parts],
         plan=plan,
-        context=ctx,
+        context=_scale_mtf_ctx(ctx, k),
         intelligence=intel,
         smc=dict(signal=base, fake=smc_res["fake"], hft=smc_res["hft"],
                  coalition=smc_res["coalition"]),

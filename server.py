@@ -465,6 +465,22 @@ def api_agent():
         return jsonify(ok=False, error=str(e)), 500
 
 
+@app.route("/api/board")
+def api_board():
+    """تابلوی لحظه ای — نقشه سطوح، بدون امتیاز جهت دار.
+
+    سطوح روی فیوچرز (۲۳ ساعته، حجم واقعی) حساب می شوند و با پایه
+    زنده به مقیاس نقدی برمی گردند تا با پلتفرم کاربر یکی باشند.
+    """
+    try:
+        import board as bd
+        d = bd.cached(force=request.args.get("fresh", "0") == "1")
+        return jsonify(ok=bool(d.get("ok")), data=d)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify(ok=False, error=str(e)[:200]), 500
+
+
 @app.route("/api/journal")
 def api_journal():
     """کارنامه سیگنال ها.
