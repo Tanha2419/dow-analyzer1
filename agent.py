@@ -561,6 +561,17 @@ def decide(interval: str = "1h", equity: float = 100_000,
 
     # ---------- طرح معامله ----------
     plan: Dict = {}
+    # اگر جهت خنثی باشد طرحی ساخته نمی شود. قبلا داشبورد در این
+    # حالت چیزی نمی گفت و کاربر فکر می کرد طرح قبلی هنوز معتبر است.
+    # حالا دلیلش صریح برگردانده می شود.
+    if direction == 0:
+        plan = dict(
+            empty=True,
+            reason_fa=label,
+            note_fa=("در این لحظه طرحی پیشنهاد نمی شود. هر عددی که "
+                     "از قبل روی صفحه مانده مربوط به محاسبه قبلی است "
+                     "و دیگر معتبر نیست."),
+        )
     if direction != 0 and base.get("plan"):
         bp = base["plan"]
         entry = float(bp["entry"])
@@ -601,6 +612,64 @@ def decide(interval: str = "1h", equity: float = 100_000,
         # می سازد، ایجنت همه لایه ها را جمع می زند. وقتی جهتشان
         # مخالف شود، ایجنت طرح خودش را می سازد. تا امروز داشبورد
         # نمی گفت کدام را دنبال کنید.
+        # ── نوع ورود و وضعیت زنده (اصلاح ۲۰۲۶-۰۹-۳۰) ────────────
+        #
+        # کاربر گزارش داد: «ورود ۵۱٬۴۵۷ زده در حالی که قیمت ۵۱٬۳۸۳
+        # بوده» و «معلوم نیست الان وارد شوم یا منتظر بمانم».
+        #
+        # ریشه: وقتی طرح از موتور SMC می آید، entry یک *سطح
+        # ساختاری* است (بلوک سفارش یا ناحیه سوییپ) نه قیمت بازار.
+        # برای شورت همیشه بالای قیمت فعلی است و برای لانگ پایین آن،
+        # چون سفارش لیمیت است. ولی داشبورد این را هیچ جا نمی گفت و
+        # کاربر فکر می کرد سیگنال بازار است.
+        _px = price * k
+        _entry = plan["entry"]
+        _gap = _entry - _px
+        # فاصله بر حسب ATR تا برای طلا و داوجونز هر دو معنی بدهد
+        _atr_disp = max(atr * k, 1e-9)
+        _gap_atr = _gap / _atr_disp
+
+        if plan_source == "agent_override":
+            # ایجنت طرح خودش را ساخته و ورود را روی قیمت جاری گذاشته
+            plan["entry_type"] = "market"
+            plan["entry_type_fa"] = "ورود بازار — همین قیمت"
+        else:
+            plan["entry_type"] = "limit"
+            plan["entry_type_fa"] = (
+                "ورود در بازگشت قیمت به این سطح (سفارش لیمیت، نه بازار)")
+
+        plan["current_price"] = round(_px, 4)
+        plan["entry_gap"] = round(_gap, 4)
+        plan["entry_gap_atr"] = round(_gap_atr, 3)
+        plan["entry_above"] = bool(_gap > 0)
+
+        # وضعیت: آیا باید منتظر ماند؟
+        if plan["entry_type"] == "market":
+            plan["entry_status"] = "now"
+            plan["entry_status_fa"] = "✅ همین حالا — ورود روی قیمت جاری است"
+        elif abs(_gap_atr) <= 0.10:
+            plan["entry_status"] = "reached"
+            plan["entry_status_fa"] = "✅ قیمت به ناحیه ورود رسیده است"
+        elif abs(_gap_atr) <= 1.0:
+            _dir_fa = "بالا" if _gap > 0 else "پایین"
+            plan["entry_status"] = "waiting"
+            plan["entry_status_fa"] = (
+                "⏳ منتظر — قیمت باید %s برود تا به ورود برسد (%s %s)"
+                % (_dir_fa, format(abs(_gap), ",.%df" % prof["decimals"]),
+                   prof["unit"]))
+        else:
+            plan["entry_status"] = "far"
+            plan["entry_status_fa"] = (
+                "⚠️ خیلی دور — ورود %s برابر ATR فاصله دارد. تا قیمت "
+                "نرسد این طرح اجرا نمی شود و ممکن است تا آن موقع "
+                "باطل شده باشد." % format(abs(_gap_atr), ".1f"))
+
+        # اعتبار زمانی: طرح تا کی معنی دارد
+        plan["valid_note"] = (
+            "این طرح بر پایه ساختار همین لحظه ساخته شده. اگر قیمت به "
+            "ناحیه ورود نرسد و ساختار عوض شود، طرح باطل است — منتظر "
+            "محاسبه بعدی بمانید.")
+
         plan["source"] = plan_source
         plan["is_primary"] = True
         if overridden:
