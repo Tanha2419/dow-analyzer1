@@ -469,13 +469,47 @@ def api_agent():
 def api_board():
     """تابلوی لحظه ای — نقشه سطوح، بدون امتیاز جهت دار.
 
-    سطوح روی فیوچرز (۲۳ ساعته، حجم واقعی) حساب می شوند و با پایه
-    زنده به مقیاس نقدی برمی گردند تا با پلتفرم کاربر یکی باشند.
+    سطوح روی فیوچرز (۲۳ ساعته، حجم واقعی) حساب می شوند و به مقیاس
+    نمایش دارایی برمی گردند تا با پلتفرم کاربر یکی باشند.
+    خروجی رویدادها را هم به روز می کند.
     """
     try:
         import board as bd
-        d = bd.cached(force=request.args.get("fresh", "0") == "1")
+        a = _asset()
+        d = bd.cached(force=request.args.get("fresh", "0") == "1", asset=a)
+        # هر بار که نقشه تازه شد، رویدادها را هم بسنج
+        try:
+            import events as ev
+            d["events"] = ev.update(d, a).get("events", [])[:12]
+        except Exception:
+            d["events"] = []
         return jsonify(ok=bool(d.get("ok")), data=d)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify(ok=False, error=str(e)[:200]), 500
+
+
+@app.route("/api/window")
+def api_window():
+    """پنجره معاملاتی — آیا این ساعت ارزش معامله دارد؟
+
+    معیار: هزینه رفت و برگشت تقسیم بر نوسان متوسط همان ساعت.
+    آمار توصیفی است، نه پیش بینی جهت.
+    """
+    try:
+        import window as wn
+        return jsonify(ok=True, data=wn.status(_asset()))
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify(ok=False, error=str(e)[:200]), 500
+
+
+@app.route("/api/events")
+def api_events():
+    """رویدادهای ثبت شده — واقعیت، نه سیگنال."""
+    try:
+        import events as ev
+        return jsonify(ok=True, data=ev.get(_asset()))
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)[:200]), 500

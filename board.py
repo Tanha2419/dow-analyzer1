@@ -39,7 +39,10 @@ import pandas as pd
 
 import dow_cash as DC
 
-FUT = "YM=F"
+# نمادی که نوسان واقعی ۲۳ ساعته دارد، برای هر دارایی
+FUT_OF = {"US30": "YM=F", "XAUUSD": "GC=F"}
+TO_SPOT = {"US30": 1.0, "XAUUSD": 0.99194589}
+FUT = "YM=F"                     # پیش فرض، برای سازگاری عقب رو
 _TTL = 300.0                     # سطوح کند تکان می خورند
 _lock = threading.Lock()
 _cache: Dict[str, object] = {"at": 0.0, "data": None}
@@ -60,9 +63,10 @@ LONDON_OPEN_H = 7                # ۱۰:۳۰ تهران
 #  داده
 # ─────────────────────────────────────────────────────────────
 
-def _load(interval: str = "5m", period: str = "5d") -> Optional[pd.DataFrame]:
+def _load(interval: str = "5m", period: str = "5d",
+          symbol: Optional[str] = None) -> Optional[pd.DataFrame]:
     import yfinance as yf
-    df = yf.Ticker(FUT).history(interval=interval, period=period)
+    df = yf.Ticker(symbol or FUT).history(interval=interval, period=period)
     if df is None or df.empty:
         return None
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -268,27 +272,39 @@ _RULES = {
 }
 
 
-def build(top: int = 10) -> Dict:
+def build(top: int = 10, asset: str = "US30") -> Dict:
     """نقشه کامل سطوح، روی مقیاس نقدی (= پلتفرم کاربر)."""
     t0 = time.time()
-    df = _load("5m", "5d")
+    asset = (asset or "US30").upper()
+    sym = FUT_OF.get(asset, FUT)
+    df = _load("5m", "5d", symbol=sym)
     if df is None or df.empty:
         return dict(ok=False, error="داده فیوچرز در دسترس نیست")
 
-    try:
-        bs = DC.compute_basis()
-        basis = float(bs.get("basis") or 0.0) if bs.get("ok") else 0.0
-    except Exception:
-        bs, basis = {}, 0.0
-    try:
-        cp = DC.cash_price()
-    except Exception:
-        cp = {}
+    # داوجونز: پایه فیوچرز منهای نقدی از dow_cash
+    # طلا: فیوچرز GC=F با ضریب ثابت به اسپات تبدیل می شود، پس
+    #      «پایه» جمعی نداریم و به جایش ضرب می کنیم.
+    bs, cp, basis, spot_k = {}, {}, 0.0, 1.0
+    if asset == "US30":
+        try:
+            bs = DC.compute_basis()
+            basis = float(bs.get("basis") or 0.0) if bs.get("ok") else 0.0
+        except Exception:
+            bs, basis = {}, 0.0
+        try:
+            cp = DC.cash_price()
+        except Exception:
+            cp = {}
+    else:
+        spot_k = TO_SPOT.get(asset, 1.0)
     fut_last = float(df["Close"].iloc[-1])
-    price = round(fut_last - basis, 1)          # مقیاس نقدی
+    _dec = 1 if asset == "US30" else 2
+    price = round(fut_last * spot_k - basis, _dec)
 
-    def cash(x):                                 # فیوچرز → نقدی
-        return None if x is None else round(float(x) - basis, 1)
+    def cash(x):                                 # فیوچرز → مقیاس نمایش
+        if x is None:
+            return None
+        return round(float(x) * spot_k - basis, _dec)
 
     ses = _sessions(df)
 
@@ -364,7 +380,7 @@ def build(top: int = 10) -> Dict:
     # ── ادغام سطوح تقریبا یکسان ──
     # مثلا «کف جلسه» و «کف دست نخورده» اغلب یک عدد اند؛ دوبار
     # نشان دادنشان تابلو را شلوغ می کند.
-    tol = max(5.0, price * 0.0002)               # حدود ۱۰ واحد
+    tol = max(price * 0.0002, 0.5 if asset != "US30" else 5.0)
     merged: List[Dict] = []
     for L in sorted(levels, key=lambda r: (-int(r["pinned"]), r["dist_abs"])):
         hit = None
@@ -388,8 +404,9 @@ def build(top: int = 10) -> Dict:
 
     return dict(
         ok=True,
+        asset=asset,
         price=price,
-        price_fut=round(fut_last, 1),
+        price_fut=round(fut_last, _dec),
         basis=round(basis, 1),
         asof=df.index[-1].isoformat(),
         candles=int(len(df)),
@@ -407,27 +424,29 @@ def build(top: int = 10) -> Dict:
         rules_note=("قاعده ها راهنمای عمومی معامله گری اند و روی این "
                     "سیستم بک تست نشده اند. سطح ها واقعی و اندازه گیری "
                     "شده اند؛ قاعده ها نه."),
-        source=dict(symbol=FUT,
+        source=dict(symbol=sym,
                     note="سطوح روی فیوچرز حساب و با پایه به مقیاس "
                          "نقدی برگردانده شده"),
         took=round(time.time() - t0, 2),
     )
 
 
-def cached(force: bool = False) -> Dict:
+def cached(force: bool = False, asset: str = "US30") -> Dict:
+    asset = (asset or "US30").upper()
     now = time.time()
+    key = "at_" + asset, "data_" + asset
     with _lock:
-        if (not force and _cache["data"] is not None
-                and now - float(_cache["at"]) < _TTL):
-            d = dict(_cache["data"])         # type: ignore[arg-type]
-            d["age_sec"] = round(now - float(_cache["at"]), 1)
+        if (not force and _cache.get(key[1]) is not None
+                and now - float(_cache.get(key[0], 0)) < _TTL):
+            d = dict(_cache[key[1]])         # type: ignore[arg-type]
+            d["age_sec"] = round(now - float(_cache[key[0]]), 1)
             d["from_cache"] = True
             return d
-    d = build()
+    d = build(asset=asset)
     if d.get("ok"):
         with _lock:
-            _cache["at"] = now
-            _cache["data"] = d
+            _cache[key[0]] = now
+            _cache[key[1]] = d
     d = dict(d)
     d["age_sec"] = 0.0
     d["from_cache"] = False
