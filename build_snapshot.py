@@ -24,10 +24,20 @@ SITE = (os.environ.get("SITE_URL") or "").rstrip("/")
 KEY = (os.environ.get("SNAPSHOT_KEY") or "").strip()
 
 # چه چیزهایی از پیش محاسبه شوند. همان ترکیب هایی که داشبورد می خواهد.
-TARGETS = [
-    ("US30", "1d"),
-    ("XAUUSD", "1d"),
-]
+#
+# پیش فرض: هر دو دارایی (سایت ترکیبی).
+# اگر سایت تک دارایی دارید، متغیر ASSETS را ست کنید تا وقت و دقیقه
+# اکشنز بی خود مصرف نشود. مثال برای سایت طلا:
+#     ASSETS=XAUUSD
+# یا برای هر دو با فاصله یا کاما:
+#     ASSETS="US30,XAUUSD"
+_raw = (os.environ.get("ASSETS") or "US30,XAUUSD").replace(" ", ",")
+_wanted = [a.strip().upper() for a in _raw.split(",") if a.strip()]
+_INTERVAL = (os.environ.get("SNAPSHOT_INTERVAL") or "1d").strip()
+
+TARGETS = [(a, _INTERVAL) for a in _wanted if a in ("US30", "XAUUSD")]
+if not TARGETS:                       # ورودی غلط ⇒ برگرد به حالت امن
+    TARGETS = [("US30", "1d"), ("XAUUSD", "1d")]
 
 
 def build_one(asset: str, interval: str):
@@ -101,8 +111,32 @@ def main() -> int:
 
     print(f"\nمحاسبه {ok_count}/{len(TARGETS)} مورد در "
           f"{time.time() - t_all:.1f} ثانیه. در حال ارسال…")
-    sent = push(items, built_at=time.time())
+    built = time.time()
+    sent = push(items, built_at=built)
     print("✅ پوش موفق" if sent else "❌ پوش ناموفق")
+
+    # ── انبار پشتیبان روی ریپو ───────────────────────────────────
+    # چرا لازم است: /tmp روی Render رایگان موقتی است و با هر خواب
+    # رفتن (۱۵ دقیقه بی کاری) پاک می شود. پوش مستقیم بالا فقط تا
+    # اولین ری استارت دوام دارد. این فایل در ریپو کامیت می شود و
+    # سایت وقتی حافظه اش خالی است از raw.githubusercontent می خواند،
+    # پس با هر ری استارت خودش را ترمیم می کند.
+    #
+    # ساختار باید دقیقا همان چیزی باشد که snapshot._read_disk
+    # انتظار دارد: {key: {payload, built_at, saved_at}}
+    try:
+        blob = {k: {"payload": v, "built_at": built, "saved_at": built}
+                for k, v in items.items()}
+        tmp = "snapshot_cache.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, "snapshot_cache.json")
+        print(f"✅ snapshot_cache.json نوشته شد "
+              f"({os.path.getsize('snapshot_cache.json'):,} بایت)")
+    except Exception as e:
+        print(f"⚠️ نوشتن فایل پشتیبان نشد: {str(e)[:120]}")
+
+    # حتی اگر پوش مستقیم شکست بخورد، فایل ریپو راه نجات است
     return 0 if sent else 1
 
 

@@ -22,6 +22,29 @@ from typing import Any, Dict, Optional
 # ولی چون اکشنز هر ۱۵ دقیقه دوباره پوش می کند، خودش را ترمیم می کند.
 _PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/dow_snapshot.json")
 
+# ── انبار پشتیبان روی ریپو (اصلاح ۲۰۲۶-۰۹-۳۰) ─────────────────────
+#
+# مشکلی که کشف شد: /tmp روی Render رایگان موقتی است. سرویس بعد از
+# ۱۵ دقیقه بی کاری می خوابد و با بیدار شدن، انبار خالی است. فرض
+# قبلی این بود که «اکشنز هر ۱۵ دقیقه ترمیمش می کند» ولی بررسی
+# تاریخچه اجراها نشان داد گیت هاب کران را throttle می کند و واقعا
+# هر ۳ تا ۴ ساعت اجرا می شود.
+#
+# نتیجه: /api/snapshot همیشه count: 0 بود و هر درخواست ایجنت یک
+# محاسبه زنده ۱۴۰ تا ۳۰۰ ثانیه ای می شد که روی ۰٫۱ CPU کل سرویس
+# را قفل می کرد.
+#
+# راه حل: همان الگوی دفترچه. اکشنز نتیجه را در ریپو کامیت می کند و
+# سایت وقتی حافظه و دیسکش خالی است، یک بار از raw.githubusercontent
+# می خواند. اندازه گیری شد: ۰٫۱۵ ثانیه برای ۳۴ کیلوبایت فشرده.
+# این با هر ری استارت خودش را ترمیم می کند.
+#
+# اگر ریپو پرایوت شود این آدرس ۴۰۴ می دهد و بی صدا به محاسبه زنده
+# برمی گردیم — یعنی رفتار بدتر از قبل نمی شود.
+_REMOTE = (os.environ.get("SNAPSHOT_REMOTE") or "").strip()
+_REMOTE_TTL = 300.0          # حداکثر هر ۵ دقیقه یک بار از گیت هاب بخوان
+_remote_at = 0.0
+
 # کلید مشترک. اگر تنظیم نشده باشد، پوش کاملاً غیرفعال است.
 _KEY = (os.environ.get("SNAPSHOT_KEY") or "").strip()
 
@@ -73,14 +96,53 @@ def _write_disk(blob: Dict[str, Any]) -> None:
         pass                            # دیسک پر/فقط خواندنی → فقط حافظه
 
 
+def _read_remote() -> Dict[str, Any]:
+    """انبار پشتیبان را از ریپو بخوان. بی صدا شکست می خورد."""
+    if not _REMOTE:
+        return {}
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            _REMOTE, headers={"User-Agent": "dow-dashboard",
+                              "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                import gzip as _gz
+                raw = _gz.decompress(raw)
+        blob = json.loads(raw.decode("utf-8"))
+        return blob if isinstance(blob, dict) else {}
+    except Exception:
+        return {}
+
+
 def _all() -> Dict[str, Any]:
-    """همه ورودی ها؛ اول حافظه، اگر خالی بود از دیسک بخوان."""
-    global _MEM
+    """همه ورودی ها. ترتیب: حافظه → دیسک → ریپو."""
+    global _MEM, _remote_at
     with _LOCK:
         if _MEM:
             return _MEM
         _MEM = _read_disk()
+        if _MEM:
+            return _MEM
+        now = time.time()
+        if _REMOTE and (now - _remote_at) >= _REMOTE_TTL:
+            _remote_at = now
+            fetch = True
+        else:
+            fetch = False
+    if not fetch:
         return _MEM
+    # بیرون از قفل، چون درخواست شبکه است و نباید بقیه را بلاک کند
+    blob = _read_remote()
+    if not blob:
+        return _MEM
+    with _LOCK:
+        if not _MEM:
+            _MEM.update(blob)
+        out = dict(_MEM)
+    _write_disk(out)               # دفعه بعد از دیسک، بدون شبکه
+    return out
 
 
 def save(key: str, payload: Any, built_at: Optional[float] = None) -> Dict:
