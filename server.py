@@ -442,6 +442,57 @@ def api_snapshot():
     return jsonify(out)
 
 
+# ════════════════════════════════════════════════════════════
+#  کش کوتاه مدت مشترک برای مسیرهای سنگین
+#
+#  ⚠ ۱ اکتبر ۲۰۲۶: /api/layers و /api/orderflow و /api/extras
+#  هیچ کشی نداشتند. layers بدتر از همه بود — کل agent.decide()
+#  با ۲۵ جزء را اجرا می کرد فقط برای برداشتن زیرشاخه
+#  institutional. روی ۰.۱ هسته CPU رندر هر کلیک ده ها ثانیه
+#  طول می کشید و اگر دو نفر همزمان می زدند، ورکر قفل می شد.
+# ════════════════════════════════════════════════════════════
+import threading as _th
+
+_RCACHE: dict = {}
+_RLOCK = _th.Lock()
+
+
+def _route_cache(key: str, ttl: float, builder):
+    """نتیجه builder را ttl ثانیه نگه می دارد.
+
+    قفل به ازای هر کلید گرفته می شود تا اگر چند درخواست همزمان
+    برای یک کلید بیایند، فقط یکی محاسبه کند و بقیه منتظر همان
+    بمانند — نه اینکه همگی موازی محاسبه کنند (که روی ۰.۱ هسته
+    ورکر را می خواباند).
+    """
+    now = _time.time()
+    with _RLOCK:
+        hit = _RCACHE.get(key)
+        if hit and (now - hit["at"]) < ttl:
+            out = dict(hit["data"])
+            out["_cache_age"] = round(now - hit["at"], 1)
+            return out
+        lk = hit.get("lock") if hit else None
+        if lk is None:
+            lk = _th.Lock()
+            _RCACHE[key] = dict(at=0.0, data={}, lock=lk)
+
+    with lk:
+        now = _time.time()
+        with _RLOCK:
+            hit = _RCACHE.get(key)
+            if hit and (now - hit["at"]) < ttl and hit.get("data"):
+                out = dict(hit["data"])
+                out["_cache_age"] = round(now - hit["at"], 1)
+                return out
+        data = builder()
+        with _RLOCK:
+            _RCACHE[key] = dict(at=_time.time(), data=data, lock=lk)
+        out = dict(data)
+        out["_cache_age"] = 0.0
+        return out
+
+
 @app.route("/api/agent")
 def api_agent():
     interval = request.args.get("interval", "1h")
@@ -593,16 +644,56 @@ def api_journal():
 
 @app.route("/api/layers")
 def api_layers():
-    """پنج لایه نهادی + بردار ویژگی."""
+    """پنج لایه نهادی + بردار ویژگی.
+
+    ⚠ ۱ اکتبر ۲۰۲۶ — دو بهینه سازی:
+      ۱) اول از انبار می خوانیم. اگر /api/agent همین تایم فریم را
+         تازه محاسبه کرده، نتیجه اش زیرشاخه institutional را هم
+         دارد و دیگر لازم نیست ۲۵ جزء از نو حساب شود.
+      ۲) اگر مجبور به محاسبه شدیم، نتیجه ۱۰ دقیقه کش می شود و
+         درخواست های همزمان پشت یک قفل صف می کشند.
+    """
     interval = request.args.get("interval", "1h")
     scale = request.args.get("scale", "1") != "0"
+    asset = _asset()
+    fresh = request.args.get("fresh", "0") == "1"
+
+    def _from_payload(d):
+        out = dict(d.get("institutional") or {})
+        if not out:
+            return None
+        out["_decision"] = d.get("decision")
+        out["_meta"] = d.get("meta")
+        return out
+
+    # ── ۱) انبار ──
+    if not fresh:
+        try:
+            import snapshot as snap
+            hit = snap.get(f"agent:{asset}:{interval}")
+            if hit and isinstance(hit.get("payload"), dict):
+                got = _from_payload(hit["payload"])
+                if got:
+                    got["_source"] = "انبار"
+                    return jsonify(ok=True, data=web_api._clean(got))
+        except Exception:
+            traceback.print_exc()
+
+    # ── ۲) محاسبه، با کش ۱۰ دقیقه ──
+    def _build():
+        d = agent_mod.decide(interval=interval, with_ml=False,
+                             with_mtf=False, with_coalition=False,
+                             scale=scale, asset=asset)
+        out = _from_payload(d) or {}
+        out["_source"] = "محاسبه زنده"
+        return web_api._clean(out)
+
     try:
-        d = agent_mod.decide(interval=interval, with_ml=False, with_mtf=False,
-                             with_coalition=False, scale=scale, asset=_asset())
-        out = d.get("institutional", {})
-        out["_decision"] = d["decision"]
-        out["_meta"] = d["meta"]
-        return jsonify(ok=True, data=web_api._clean(out))
+        key = f"layers:{asset}:{interval}:{int(scale)}"
+        if fresh:
+            with _RLOCK:
+                _RCACHE.pop(key, None)
+        return jsonify(ok=True, data=_route_cache(key, 600.0, _build))
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
@@ -632,13 +723,22 @@ def api_vol():
 @app.route("/api/orderflow")
 def api_flow():
     iv = request.args.get("interval", "1h")
-    try:
-        p = assets_mod.profile(_asset())
+    asset = _asset()
+
+    # ⚠ ۱ اکتبر ۲۰۲۶ — کش ۵ دقیقه. جریان سفارش از کندل ساخته
+    # می شود و زیر یک کندل تغییر معناداری ندارد.
+    def _build():
+        p = assets_mod.profile(asset)
         d = orderflow.build_orderflow(p["candle_symbol"], iv,
                                       with_seasonality=True)
         if d.get("delta", {}).get("series"):
-            d["delta"]["series"] = {k: v[-90:] for k, v in d["delta"]["series"].items()}
-        return jsonify(ok=True, data=web_api._clean(d))
+            d["delta"]["series"] = {k: v[-90:]
+                                    for k, v in d["delta"]["series"].items()}
+        return web_api._clean(d)
+
+    try:
+        return jsonify(ok=True, data=_route_cache(
+            f"flow:{asset}:{iv}", 300.0, _build))
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
@@ -907,16 +1007,22 @@ def api_extras():
     import macro_extras as mx
     what = (request.args.get("what") or "all").lower()
     asset = _asset()
-    try:
+
+    # ⚠ ۱ اکتبر ۲۰۲۶ — کش. تایمر کیل زون ثانیه ای است پس کش
+    # کوتاه می گیرد؛ همبستگی دلار و شمارش فدرال رزرو کند تغییر
+    # می کنند و ۱۵ دقیقه کش می شوند.
+    def _build():
         if what == "killzone":
-            out = mx.killzone_timer(asset)
-        elif what == "dxy":
-            out = mx.dxy_correlation(asset)
-        elif what == "fomc":
-            out = mx.fomc_countdown()
-        else:
-            out = mx.build_extras(asset)
-        return jsonify(web_api._clean(out))
+            return web_api._clean(mx.killzone_timer(asset))
+        if what == "dxy":
+            return web_api._clean(mx.dxy_correlation(asset))
+        if what == "fomc":
+            return web_api._clean(mx.fomc_countdown())
+        return web_api._clean(mx.build_extras(asset))
+
+    ttl = 20.0 if what == "killzone" else 900.0
+    try:
+        return jsonify(_route_cache(f"extras:{asset}:{what}", ttl, _build))
     except Exception as e:
         return jsonify(dict(ok=False, error=str(e)[:200])), 200
 

@@ -59,7 +59,58 @@ def _pctile(asset: str, a: float) -> Optional[int]:
     return None
 
 
-def compute(asset: str = "US30", interval: str = "1d") -> Dict:
+def _plan(entry_raw: float, atr_raw: float, direction: int,
+          target_r: float, scale: float, decimals: int,
+          equity: float, risk_pct: float) -> Optional[Dict]:
+    """طرح معامله دقیقا با همان پارامترهایی که بک تست سنجیده.
+
+    ⚠ ۱ اکتبر ۲۰۲۶: کارت «برگه طرح معامله» حد ضرر را از سطوح
+    ساختاری SMC می گیرد و نتیجه اش ۲.۵۴ برابر ATR درآمد، با هدف
+    اول روی ۱.۱۱R. ولی نرخ برد ۶۲.۳٪ و R+۰.۶۳۹ با حد ضرر
+    ۱ ATR و هدف ۲ ATR اندازه گیری شده بود. یعنی دنبال کردن آن
+    طرح، استراتژی دیگری است با آمار نامعلوم.
+
+    این تابع همان قواعد بک تست را می سازد و بس:
+        حد ضرر = ورود ∓ ۱ × ATR
+        هدف     = ورود ± target_r × ATR
+    """
+    if not direction or atr_raw <= 0:
+        return None
+
+    stop_raw = entry_raw - direction * atr_raw
+    tgt_raw = entry_raw + direction * target_r * atr_raw
+
+    entry = entry_raw * scale
+    stop = stop_raw * scale
+    target = tgt_raw * scale
+    risk_unit = abs(entry - stop)
+    if risk_unit <= 0:
+        return None
+
+    risk_money = equity * risk_pct / 100.0
+    return dict(
+        side=("خرید (LONG)" if direction > 0 else "فروش (SHORT)"),
+        side_en=("long" if direction > 0 else "short"),
+        entry=round(entry, decimals),
+        stop=round(stop, decimals),
+        target=round(target, decimals),
+        risk_unit=round(risk_unit, decimals),
+        reward_unit=round(abs(target - entry), decimals),
+        rr=target_r,
+        stop_atr=1.0,
+        atr=round(atr_raw * scale, decimals),
+        size_units=round(risk_money / risk_unit, 4),
+        risk_money=risk_money,
+        equity=equity, risk_pct=risk_pct,
+        note_fa=("حد ضرر دقیقا ۱ برابر ATR و هدف %.1f برابر ATR است "
+                 "— همان قواعدی که بک تست با آنها سنجیده شد. اگر "
+                 "اعداد دیگری معامله کنید، آمار بالا دیگر معتبر نیست."
+                 % target_r),
+    )
+
+
+def compute(asset: str = "US30", interval: str = "1d",
+            equity: float = 10_000.0, risk_pct: float = 1.0) -> Dict:
     """امتیاز موتور اعتبارسنجی شده روی آخرین کندل بسته شده."""
     import agent
     import assets as A
@@ -95,6 +146,16 @@ def compute(asset: str = "US30", interval: str = "1d") -> Dict:
     sc = (float(prof["display_scale"])
           if prof.get("basis_mode") == "scale" else 1.0)
 
+    # ATR دقیقا با همان فرمول بک تست — True Range، میانگین ۱۴
+    import numpy as _np
+    _h, _l, _c = df["High"], df["Low"], df["Close"]
+    _pc = _c.shift(1)
+    _tr = __import__("pandas").concat(
+        [_h - _l, (_h - _pc).abs(), (_l - _pc).abs()], axis=1).max(axis=1)
+    atr_raw = float(_tr.rolling(14, min_periods=7).mean().iloc[-1])
+    if not _np.isfinite(atr_raw):
+        atr_raw = 0.0
+
     dist = _DIST.get(key, {})
     return dict(
         ok=True, asset=key, interval=interval,
@@ -108,6 +169,8 @@ def compute(asset: str = "US30", interval: str = "1d") -> Dict:
         parts=s.get("parts") or {},
         bar_date=str(df.index[-1])[:10],
         price=round(raw_price * sc, 2),
+        plan=_plan(raw_price, atr_raw, direction, cfg["target_r"],
+                   sc, int(prof.get("decimals", 2)), equity, risk_pct),
         evidence=dict(n=cfg["n"], win_rate=cfg["win_rate"],
                       avg_r=cfg["avg_r"], t_stat=cfg["t_stat"]),
         frequency=dict(hit_rate_pct=dist.get("hit_rate"),
@@ -125,10 +188,11 @@ def compute(asset: str = "US30", interval: str = "1d") -> Dict:
 
 
 def cached(asset: str = "US30", interval: str = "1d",
-           force: bool = False) -> Dict:
+           force: bool = False, equity: float = 10_000.0,
+           risk_pct: float = 1.0) -> Dict:
     """نسخه کش شده — محاسبه حدود ۰.۴ ثانیه است ولی روی ۰.۱ هسته
     CPU رندر همان هم ارزش کش کردن دارد."""
-    k = "%s:%s" % (asset, interval)
+    k = "%s:%s:%s:%s" % (asset, interval, equity, risk_pct)
     now = time.time()
     with _lock:
         hit = _cache.get(k)
@@ -136,7 +200,7 @@ def cached(asset: str = "US30", interval: str = "1d",
             out = dict(hit["data"])
             out["age_sec"] = round(now - hit["at"], 1)
             return out
-    data = compute(asset, interval)
+    data = compute(asset, interval, equity, risk_pct)
     if data.get("ok"):
         with _lock:
             _cache[k] = dict(at=now, data=data)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import numpy as np
 import os
 import time
 from datetime import datetime, timezone
@@ -32,6 +33,10 @@ MAX_ROWS = int(os.environ.get("JOURNAL_MAX_ROWS", "5000"))
 
 # چند کندل جلوتر را برای ارزیابی نگاه کنیم
 HORIZON = {"5m": 12, "15m": 8, "30m": 6, "1h": 8, "1d": 5}
+
+# ⚠ ثابت ها و تابع نتیجه، داخل evaluate() لود می شوند نه اینجا.
+# دلیل: engine_backtest خودش agent را import می کند و agent هم
+# journal را — یعنی import در سطح ماژول حلقه می سازد.
 
 # آستانه موفقیت بر حسب ATR
 WIN_ATR = 0.75
@@ -245,6 +250,11 @@ def merge(incoming: List[Dict]) -> Dict:
 
 def evaluate(limit: int = 500) -> Dict:
     """نتیجه سیگنال های ثبت شده را با داده واقعی بازار می سنجد."""
+    # ایمپورت تنبل — جلوگیری از حلقه ایمپورت
+    import engine_backtest as eb
+    from engine_backtest import COST_PCT
+    from signal_filter import BEST_R
+
     rows = _load()
     if not rows:
         return dict(ok=True, n=0, note="هنوز سیگنالی ثبت نشده")
@@ -293,9 +303,16 @@ def evaluate(limit: int = 500) -> Dict:
             lo = float(w["Low"].min())
             close = float(w["Close"].iloc[-1])
 
-            tr = (df["High"] - df["Low"]).rolling(14).mean()
+            # ⚠ اصلاح ۱ اکتبر ۲۰۲۶ — ATR واقعی، نه دامنه ساده.
+            # قبلا (High - Low).rolling(14) بود که شکاف قیمتی را
+            # نادیده می گیرد. حالا True Range کامل، عین موتور بک تست.
+            _h, _l, _c = df["High"], df["Low"], df["Close"]
+            _pc = _c.shift(1)
+            _tr = pd.concat([_h - _l, (_h - _pc).abs(),
+                             (_l - _pc).abs()], axis=1).max(axis=1)
+            tr = _tr.rolling(14, min_periods=7).mean()
             atr = float(tr[idx <= t0].iloc[-1]) if (idx <= t0).any() else None
-            if not atr or atr <= 0:
+            if not atr or atr <= 0 or not np.isfinite(atr):
                 continue
 
             side = 1 if r["score"] > 0 else (-1 if r["score"] < 0 else 0)
@@ -305,16 +322,37 @@ def evaluate(limit: int = 500) -> Dict:
                 done += 1
                 continue
 
-            move = (close - entry) * side
-            best = (hi - entry) if side > 0 else (entry - lo)
-            r_mult = move / atr
-            hit = best >= WIN_ATR * atr
+            # ⚠ اصلاح ۱ اکتبر ۲۰۲۶ — تعریف یکتای R.
+            #
+            # قبلا: r_mult = (close - entry) * side / atr
+            # یعنی فقط قیمت پایان افق. نه حد ضرر اعمال می شد، نه
+            # سقف هدف، نه هزینه. معامله ای که ۳ ATR ضرر داده و بعد
+            # برگشته بود، «موفق» شمرده می شد. ۵ رکورد از ۷ رکورد
+            # ارزیابی شده دقیقا همین حالت بودند.
+            #
+            # حالا همان تابعی صدا زده می شود که بک تست استفاده
+            # می کند: حد ضرر ۱ ATR، هدف BEST_R × ATR، منهای هزینه.
+            best_r = BEST_R.get(r["asset"], 2.0)
+            cost_pct = COST_PCT.get(r["asset"], 0.015)
+            cost_r = (cost_pct / 100.0) * entry / atr
+
+            res = eb.outcome_at_entry(w, entry, side, atr, best_r, cost_r)
+            if not res:
+                continue
+
             r["checked"] = True
             r["outcome"] = dict(
-                result=("موفق" if r_mult > 0 else "ناموفق"),
-                touched_target=bool(hit),
-                r_mult=round(r_mult, 3),
-                move_pct=round((close - entry) / entry * 100, 3),
+                result=("موفق" if res["win"] else "ناموفق"),
+                r_mult=round(float(res["r"]), 3),
+                exit_reason=res["exit"],
+                target_r=best_r,
+                stop_atr=1.0,
+                cost_r=round(cost_r, 4),
+                # درصد حرکت جهت دار — قبلا خام بود و یک فروش موفق
+                # درصد منفی نشان می داد
+                move_pct=round((close - entry) / entry * 100 * side, 3),
+                best_excursion_r=round(
+                    ((hi - entry) if side > 0 else (entry - lo)) / atr, 3),
                 bars=k, atr=round(atr, 4),
                 checked_at=_now().isoformat())
             done += 1

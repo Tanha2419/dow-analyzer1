@@ -190,18 +190,28 @@ def score_at(df: pd.DataFrame, idx: int, interval: str) -> Optional[Dict]:
                 parts={p[0]: round(p[1], 2) for p in parts})
 
 
-def _outcome(df: pd.DataFrame, idx: int, direction: int, atr: float,
-             horizon: int, r_mult: float, cost: float) -> Optional[Dict]:
-    """نتیجه واقعی معامله — لمس High/Low، نه فقط Close."""
-    entry = float(df["Close"].iloc[idx])
+def outcome_at_entry(fut: pd.DataFrame, entry: float, direction: int,
+                     atr: float, r_mult: float,
+                     cost: float) -> Optional[Dict]:
+    """نتیجه یک معامله با قیمت ورود مشخص — تعریف یکتای R در کل پروژه.
+
+    ⚠ ۱ اکتبر ۲۰۲۶: این تابع از دل _outcome بیرون کشیده شد تا
+    دفترچه هم دقیقا همین منطق را به کار ببرد. قبلا دفترچه
+    `r = (close - entry)/atr` حساب می کرد — بدون حد ضرر، بدون
+    سقف هدف، بدون هزینه. نتیجه: میانگین R+۴.۹۲ گزارش می شد در
+    حالی که همان رکوردها با این تابع R−۰.۷۰۸ می دهند (۵ معامله
+    از ۷ تا حد ضرر خورده بودند و «موفق» شمرده شده بودند).
+
+    قواعد: حد ضرر = ۱ ATR · هدف = r_mult × ATR · اگر در یک کندل
+    هر دو لمس شوند بدبینانه حد ضرر فرض می شود.
+    """
+    if fut is None or len(fut) < 2:
+        return None
     if not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
         return None
 
     tgt = entry + direction * r_mult * atr
     stp = entry - direction * atr
-    fut = df.iloc[idx + 1: idx + 1 + horizon]
-    if len(fut) < 2:
-        return None
 
     for _, row in fut.iterrows():
         hi, lo = float(row["High"]), float(row["Low"])
@@ -217,6 +227,16 @@ def _outcome(df: pd.DataFrame, idx: int, direction: int, atr: float,
     last = float(fut["Close"].iloc[-1])
     r = direction * (last - entry) / atr - cost
     return dict(win=r > 0, r=round(r, 3), exit="پایان افق")
+
+
+def _outcome(df: pd.DataFrame, idx: int, direction: int, atr: float,
+             horizon: int, r_mult: float, cost: float) -> Optional[Dict]:
+    """نتیجه واقعی معامله — لمس High/Low، نه فقط Close."""
+    entry = float(df["Close"].iloc[idx])
+    if not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
+        return None
+    return outcome_at_entry(df.iloc[idx + 1: idx + 1 + horizon],
+                            entry, direction, atr, r_mult, cost)
 
 
 def run(asset: str = "US30", interval: str = "1h",
