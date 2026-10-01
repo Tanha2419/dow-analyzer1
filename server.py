@@ -165,20 +165,20 @@ def api_quality():
             sc = request.args.get("score")
             iv = request.args.get("interval", "1d")
             if sc in (None, ""):
-                # امتیاز داده نشده → اول از انبار، بعد محاسبه زنده
-                dec = None
-                try:
-                    import snapshot as snap
-                    hit = snap.get(f"agent:{a}:{iv}")
-                    if hit and isinstance(hit["payload"], dict):
-                        dec = (hit["payload"].get("decision") or {})
-                except Exception:
-                    dec = None
-                if not dec:
-                    import agent as _ag
-                    d = _ag.decide(interval=iv, asset=a)
-                    dec = d.get("decision") or {}
-                sc = dec.get("score", dec.get("raw_score", 0))
+                # ⚠ اصلاح ۱ اکتبر ۲۰۲۶: اینجا قبلا امتیاز ایجنت
+                # خوانده می شد و آستانه بک تست رویش گذاشته می شد.
+                # آن دو هم مقیاس نیستند — ایجنت ۲۵ جزء دارد و موتور
+                # بک تست ۶ تا، پس آستانه ۳۲ روی امتیاز ایجنت معنا
+                # نداشت و عملا هیچ وقت فعال نمی شد.
+                # حالا از همان موتوری می خوانیم که آستانه از آن درآمده.
+                import validated as vd
+                v = vd.cached(asset=a, interval=iv)
+                if not v.get("ok"):
+                    return jsonify(dict(
+                        ok=False,
+                        error=v.get("error") or "امتیاز معتبر در دسترس نیست",
+                        note_fa=v.get("note_fa")))
+                sc = v["score"]
             out = sf.assess(a, float(sc), iv)
         return jsonify(web_api._clean(out))
     except Exception as e:
