@@ -746,53 +746,91 @@ def decide(interval: str = "1h", equity: float = 100_000,
 
 
 # ================================================================ بخش ۵: ژورنال
-def journal_add(entry: Dict) -> None:
+def journal_add(entry: Dict) -> bool:
+    """افزودن رکورد به ژورنال توزیع ها — بدون تکرار.
+
+    ⚠ از وقتی نتیجه ایجنت از انبار سرو می شود، هر چند دقیقه
+    دقیقا همان رکورد دوباره می رسد (ts همان لحظه محاسبه است،
+    نه لحظه درخواست). بدون این بررسی، توزیع روز هفته و برچسب ها
+    با یک سیگنال تکراری پر می شد و آمار بی معنا می گشت.
+
+    خروجی: True اگر واقعا نوشته شد.
+    """
     JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    key = (str(entry.get("ts")), str(entry.get("interval")),
+           str(entry.get("asset")))
+    if not entry.get("ts"):
+        return False
+    try:
+        if JOURNAL.exists():
+            for ln in JOURNAL.read_text(
+                    encoding="utf-8").splitlines()[-400:]:
+                try:
+                    o = json.loads(ln)
+                except Exception:
+                    continue
+                if (str(o.get("ts")), str(o.get("interval")),
+                        str(o.get("asset"))) == key:
+                    return False
+    except Exception:
+        pass
     with JOURNAL.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return True
 
 
 def journal_from_decision(d: Dict) -> Dict:
-    """ساخت رکورد ژورنال با برچسب های خودکار."""
-    ctx = d["context"]
-    intel = d["intelligence"]
+    """ساخت رکورد ژورنال با برچسب های خودکار.
+
+    ⚠ ورودی دو شکل دارد:
+      ۱) خروجی کامل decide()
+      ۲) نسخه سبک شده ای که از انبار (snapshot) می آید و کلید
+         intelligence در آن حذف شده است.
+    پس هیچ کلیدی با [] خوانده نمی شود. تجربه ۳۰ سپتامبر: یک
+    دسترسی مستقیم d["plan"]["entry"] کل اجرای ایجنت را می شکست.
+    """
+    ctx = d.get("context") or {}
+    intel = d.get("intelligence") or {}
+    dec = d.get("decision") or {}
+    meta = d.get("meta") or {}
     tags: List[str] = []
 
-    kz = ctx["killzone"]
+    kz = ctx.get("killzone") or {}
     if kz.get("active"):
-        tags.append(f"سشن:{kz['active']['name']}")
-    tags.append(f"رژیم:{intel['regime']['label']}")
-    if d["smc"]["fake"]["score"] > 50:
+        tags.append(f"سشن:{(kz['active'] or {}).get('name')}")
+    reg = (intel.get("regime") or {}).get("label")
+    if reg:
+        tags.append(f"رژیم:{reg}")
+    if ((d.get("smc") or {}).get("fake") or {}).get("score", 0) > 50:
         tags.append("ریسک روند فیک")
-    if ctx.get("sentiment", {}).get("ok") and ctx["sentiment"]["vix"]["spike"]:
+    sen = ctx.get("sentiment") or {}
+    if sen.get("ok") and (sen.get("vix") or {}).get("spike"):
         tags.append("جهش VIX")
-    if ctx.get("calendar", {}).get("next_event"):
-        ne = ctx["calendar"]["next_event"]
-        if ne["hours"] is not None and ne["hours"] < 6:
-            tags.append(f"نزدیک خبر:{ne['key']}")
-    for it in intel["divergence"]["items"][:2]:
-        tags.append(f"واگرایی:{it['kind']}-{it['indicator']}")
-    if intel.get("anomaly", {}).get("n_recent", 0) > 0:
+    ne = (ctx.get("calendar") or {}).get("next_event")
+    if ne and ne.get("hours") is not None and ne["hours"] < 6:
+        tags.append(f"نزدیک خبر:{ne.get('key')}")
+    for it in ((intel.get("divergence") or {}).get("items") or [])[:2]:
+        tags.append(f"واگرایی:{it.get('kind')}-{it.get('indicator')}")
+    if (intel.get("anomaly") or {}).get("n_recent", 0) > 0:
         tags.append("ردپای نهادی")
-    im = ctx.get("intermarket", {})
+    im = ctx.get("intermarket") or {}
     if im.get("ok") and im.get("headwinds"):
         tags.append(f"باد مخالف:{len(im['headwinds'])}")
 
+    pl = d.get("plan") or {}
+    sz = pl.get("sizing") or {}
     rec = dict(
-        ts=d["meta"]["generated"], interval=d["meta"]["interval"],
-        price=d["meta"]["price"], direction=d["decision"]["direction"],
-        label=d["decision"]["label"], grade=d["decision"]["grade"],
-        score=d["decision"]["score"], confidence=d["decision"]["confidence"],
-        gate=ctx["gate"]["mode"], tags=tags,
-        # ⚠ باگ ۲۰۲۶-۰۹-۳۰: اینجا فقط truthy بودن plan چک می شد.
-        # وقتی طرح خالی را از {} به {"empty": True, ...} تغییر دادم،
-        # این شرط رد شد و d["plan"]["entry"] خطای KeyError داد.
-        # حالا وجود خود کلید entry بررسی می شود.
-        plan=None if not (d.get("plan") or {}).get("entry") else dict(
-            entry=d["plan"]["entry"], stop=d["plan"]["stop"],
-            tp1=d["plan"]["tp1"],
-            units=d["plan"]["sizing"]["units"],
-            risk_pct=d["plan"]["sizing"]["risk_pct"]),
+        ts=meta.get("generated"), interval=meta.get("interval"),
+        asset=meta.get("asset") or ctx.get("asset"),
+        price=meta.get("price"), direction=dec.get("direction"),
+        label=dec.get("label"), grade=dec.get("grade"),
+        score=dec.get("score"), confidence=dec.get("confidence"),
+        gate=(ctx.get("gate") or {}).get("mode"), tags=tags,
+        # فقط وقتی ورود واقعی هست؛ طرح خالی {"empty": True} ورود ندارد.
+        plan=None if not pl.get("entry") else dict(
+            entry=pl.get("entry"), stop=pl.get("stop"),
+            tp1=pl.get("tp1"),
+            units=sz.get("units"), risk_pct=sz.get("risk_pct")),
     )
     return rec
 

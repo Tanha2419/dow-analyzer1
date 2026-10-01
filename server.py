@@ -435,7 +435,14 @@ def api_agent():
 
     # ── اول انبار: اگر نتیجه تازه ای هست، فوری بده (زیر یک ثانیه) ──
     # با ?fresh=1 می توان محاسبه زنده را اجبار کرد.
-    if request.args.get("fresh", "0") != "1" and not log:
+    #
+    # ⚠ تا ۱ اکتبر اینجا «and not log» بود. چون رابط کاربری همیشه
+    # log=1 می فرستد، انبار عملا هرگز استفاده نمی شد و هر بار یک
+    # محاسبه ۳۴ ثانیه ای روی ۰.۱ هسته CPU اجرا می شد — هر ۱۷۰ ثانیه
+    # یک بار، برای هر تب باز. حالا انبار همیشه اول بررسی می شود و
+    # ثبت در دفترچه جدا انجام می گیرد (پایین). ثبت تکراری هم نمی شود:
+    # دفترچه اصلی کلید کندلی دارد و journal_add هم ts تکراری را رد می کند.
+    if request.args.get("fresh", "0") != "1":
         try:
             import snapshot as snap
             hit = snap.get(f"agent:{_asset()}:{interval}")
@@ -448,6 +455,12 @@ def api_agent():
                     "note": "نتیجه از پیش محاسبه شده — برای محاسبه زنده "
                             "«fresh=1» را به آدرس اضافه کنید",
                 }
+                if log:
+                    try:
+                        agent_mod.journal_add(
+                            agent_mod.journal_from_decision(d))
+                    except Exception:
+                        pass          # ثبت دفترچه هرگز پاسخ را نشکند
                 return jsonify(ok=True, data=d)
         except Exception:
             pass                      # انبار خراب بود → محاسبه زنده
