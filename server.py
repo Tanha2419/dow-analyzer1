@@ -456,6 +456,38 @@ import threading as _th
 _RCACHE: dict = {}
 _RLOCK = _th.Lock()
 
+# ── نگهبان محاسبه سنگین ───────────────────────────────────────
+# روی Render رایگان (۰.۱ هسته) یک agent.decide کامل بیش از ۵
+# دقیقه طول می کشد. با --workers 1 تمام سایت در آن مدت می خوابد
+# (حتی /api/ping). پس هم زمان بیش از یک محاسبه سنگین اجازه
+# نداریم؛ بقیه یا داده کهنه برچسب دار می گیرند یا پیام روشن.
+_HEAVY = _th.BoundedSemaphore(1)
+
+
+def _heavy_free() -> bool:
+    """آیا ظرفیت محاسبه سنگین آزاد است؟ (بدون انتظار)"""
+    return _HEAVY.acquire(blocking=False)
+
+
+def _snap_stale(key: str, conv):
+    """نتیجه کهنه انبار با برچسب سن — جایگزین محاسبه زنده قفل کننده."""
+    try:
+        import snapshot as snap
+        hit = snap.get_any(key)
+        if not hit or not isinstance(hit.get("payload"), dict):
+            return None
+        got = conv(hit["payload"])
+        if not got:
+            return None
+        got["_source"] = "انبار (کهنه)" if hit.get("stale") else "انبار"
+        got["_age_fa"] = hit.get("age_fa")
+        got["_age_sec"] = round(float(hit.get("age") or 0), 1)
+        got["_stale"] = bool(hit.get("stale"))
+        return got
+    except Exception:
+        traceback.print_exc()
+        return None
+
 
 def _route_cache(key: str, ttl: float, builder):
     """نتیجه builder را ttl ثانیه نگه می دارد.
@@ -513,29 +545,55 @@ def api_agent():
     # یک بار، برای هر تب باز. حالا انبار همیشه اول بررسی می شود و
     # ثبت در دفترچه جدا انجام می گیرد (پایین). ثبت تکراری هم نمی شود:
     # دفترچه اصلی کلید کندلی دارد و journal_add هم ts تکراری را رد می کند.
-    if request.args.get("fresh", "0") != "1":
+    #
+    # ⚠ اصلاح ۱ اکتبر (دوم): قبلا فقط نتیجه «تازه» پذیرفته می شد و
+    # اگر انبار از ۴ ساعت رد می شد، هر درخواست یک محاسبه زنده چند
+    # دقیقه ای روی ۰.۱ هسته راه می انداخت که با تک ورکر کل سایت را
+    # قفل می کرد. حالا نتیجه کهنه هم سرو می شود، فقط با برچسب صریح.
+    fresh_req = request.args.get("fresh", "0") == "1"
+
+    def _serve_snap(allow_stale: bool):
         try:
             import snapshot as snap
-            hit = snap.get(f"agent:{_asset()}:{interval}")
-            if hit and isinstance(hit["payload"], dict):
-                d = dict(hit["payload"])
-                d["_snapshot"] = {
-                    "from_cache": True,
-                    "age_sec": round(hit["age"], 1),
-                    "age_fa": snap._age_fa(hit["age"]),
-                    "note": "نتیجه از پیش محاسبه شده — برای محاسبه زنده "
-                            "«fresh=1» را به آدرس اضافه کنید",
-                }
-                if log:
-                    try:
-                        agent_mod.journal_add(
-                            agent_mod.journal_from_decision(d))
-                    except Exception:
-                        pass          # ثبت دفترچه هرگز پاسخ را نشکند
-                return jsonify(ok=True, data=d)
+            hit = snap.get_any(f"agent:{_asset()}:{interval}")
+            if not hit or not isinstance(hit.get("payload"), dict):
+                return None
+            if hit.get("stale") and not allow_stale:
+                return None
+            d = dict(hit["payload"])
+            d["_snapshot"] = {
+                "from_cache": True,
+                "stale": bool(hit.get("stale")),
+                "age_sec": round(float(hit.get("age") or 0), 1),
+                "age_fa": hit.get("age_fa"),
+                "note": ("نتیجه از پیش محاسبه شده — برای محاسبه زنده "
+                         "«fresh=1» را به آدرس اضافه کنید"),
+            }
+            if log:
+                try:
+                    agent_mod.journal_add(
+                        agent_mod.journal_from_decision(d))
+                except Exception:
+                    pass              # ثبت دفترچه هرگز پاسخ را نشکند
+            return d
         except Exception:
-            pass                      # انبار خراب بود → محاسبه زنده
+            traceback.print_exc()
+            return None               # انبار خراب بود → محاسبه زنده
 
+    if not fresh_req:
+        d = _serve_snap(allow_stale=False)
+        if d is not None:
+            return jsonify(ok=True, data=d)
+        d = _serve_snap(allow_stale=True)        # کهنه، ولی برچسب دار
+        if d is not None:
+            return jsonify(ok=True, data=d)
+
+    # ── محاسبه زنده — فقط یکی در هر لحظه، وگرنه سایت می خوابد ──
+    if not _heavy_free():
+        return jsonify(
+            ok=False,
+            error=("یک محاسبه سنگین همین حالا در جریان است. "
+                   "چند لحظه دیگر دوباره بزنید.")), 503
     try:
         d = agent_mod.decide(interval=interval, equity=equity, with_ml=with_ml,
                              with_mtf=with_mtf, with_coalition=True, scale=scale,
@@ -547,6 +605,8 @@ def api_agent():
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
+    finally:
+        _HEAVY.release()
 
 
 @app.route("/api/board")
@@ -666,18 +726,13 @@ def api_layers():
         out["_meta"] = d.get("meta")
         return out
 
-    # ── ۱) انبار ──
+    snap_key = f"agent:{asset}:{interval}"
+
+    # ── ۱) انبار تازه ──
     if not fresh:
-        try:
-            import snapshot as snap
-            hit = snap.get(f"agent:{asset}:{interval}")
-            if hit and isinstance(hit.get("payload"), dict):
-                got = _from_payload(hit["payload"])
-                if got:
-                    got["_source"] = "انبار"
-                    return jsonify(ok=True, data=web_api._clean(got))
-        except Exception:
-            traceback.print_exc()
+        got = _snap_stale(snap_key, _from_payload)
+        if got and not got.get("_stale"):
+            return jsonify(ok=True, data=web_api._clean(got))
 
     # ── ۲) محاسبه، با کش ۱۰ دقیقه ──
     def _build():
@@ -688,15 +743,39 @@ def api_layers():
         out["_source"] = "محاسبه زنده"
         return web_api._clean(out)
 
+    key = f"layers:{asset}:{interval}:{int(scale)}"
+    if fresh:
+        with _RLOCK:
+            _RCACHE.pop(key, None)
+
+    # کش داغ؟ بدون نگهبان جواب بده (محاسبه ای در کار نیست).
+    with _RLOCK:
+        hot = _RCACHE.get(key)
+        if hot and (_time.time() - hot["at"]) < 600.0 and hot.get("data"):
+            out = dict(hot["data"])
+            out["_cache_age"] = round(_time.time() - hot["at"], 1)
+            return jsonify(ok=True, data=out)
+
+    # ── ۳) انبار کهنه، با برچسب صریح ──
+    # بهتر از قفل کردن کل سایت برای ۵ دقیقه. با fresh=1 دور زدنی است.
+    if not fresh:
+        got = _snap_stale(snap_key, _from_payload)
+        if got:
+            return jsonify(ok=True, data=web_api._clean(got))
+
+    # ── ۴) محاسبه زنده — فقط یکی در هر لحظه ──
+    if not _heavy_free():
+        return jsonify(
+            ok=False,
+            error=("یک محاسبه سنگین همین حالا در جریان است. "
+                   "چند لحظه دیگر دوباره بزنید.")), 503
     try:
-        key = f"layers:{asset}:{interval}:{int(scale)}"
-        if fresh:
-            with _RLOCK:
-                _RCACHE.pop(key, None)
         return jsonify(ok=True, data=_route_cache(key, 600.0, _build))
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
+    finally:
+        _HEAVY.release()
 
 
 @app.route("/api/macro")

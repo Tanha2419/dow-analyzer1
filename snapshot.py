@@ -63,6 +63,10 @@ _REMOTE = (os.environ.get("SNAPSHOT_REMOTE") or "").strip() or _default_remote()
 _REMOTE_TTL = 300.0          # حداکثر هر ۵ دقیقه یک بار از گیت هاب بخوان
 _remote_at = 0.0
 
+# اگر تازه ترین ورودی از این کهنه تر بود، از ریپو بپرس شاید
+# اکشنز نسخه جدیدی کامیت کرده باشد. (۱۵ دقیقه)
+_REFRESH_AFTER = float(os.environ.get("SNAPSHOT_REFRESH_AFTER", "900"))
+
 # کلید مشترک. اگر تنظیم نشده باشد، پوش کاملاً غیرفعال است.
 _KEY = (os.environ.get("SNAPSHOT_KEY") or "").strip()
 
@@ -134,33 +138,106 @@ def _read_remote() -> Dict[str, Any]:
         return {}
 
 
-def _all() -> Dict[str, Any]:
-    """همه ورودی ها. ترتیب: حافظه → دیسک → ریپو."""
-    global _MEM, _remote_at
-    with _LOCK:
-        if _MEM:
-            return _MEM
-        _MEM = _read_disk()
-        if _MEM:
-            return _MEM
-        now = time.time()
-        if _REMOTE and (now - _remote_at) >= _REMOTE_TTL:
-            _remote_at = now
-            fetch = True
-        else:
-            fetch = False
-    if not fetch:
-        return _MEM
-    # بیرون از قفل، چون درخواست شبکه است و نباید بقیه را بلاک کند
+def _newest(blob: Dict[str, Any]) -> float:
+    """تازه ترین built_at بین همه ورودی ها (۰ اگر هیچ)."""
+    best = 0.0
+    for e in (blob or {}).values():
+        if not isinstance(e, dict):
+            continue
+        try:
+            b = float(e.get("built_at") or 0)
+        except (TypeError, ValueError):
+            b = 0.0
+        if b > best:
+            best = b
+    return best
+
+
+def _merge(dst: Dict[str, Any], src: Dict[str, Any]) -> bool:
+    """ورودی های تازه تر src را روی dst بنشان. True اگر چیزی عوض شد.
+
+    کلید به کلید مقایسه می کنیم، چون ممکن است یک کلید روی سایت
+    تازه تر باشد (پوش مستقیم اکشنز) و کلید دیگر روی ریپو.
+    """
+    changed = False
+    for k, e in (src or {}).items():
+        if not isinstance(e, dict):
+            continue
+        try:
+            nb = float(e.get("built_at") or 0)
+        except (TypeError, ValueError):
+            nb = 0.0
+        old = dst.get(k)
+        ob = -1.0
+        if isinstance(old, dict):
+            try:
+                ob = float(old.get("built_at") or 0)
+            except (TypeError, ValueError):
+                ob = 0.0
+        if nb > ob:
+            dst[k] = e
+            changed = True
+    return changed
+
+
+def _pull_remote() -> bool:
+    """یک بار از ریپو بخوان و ادغام کن. True اگر داده تازه تری آمد."""
     blob = _read_remote()
     if not blob:
-        return _MEM
+        return False
+    with _LOCK:
+        changed = _merge(_MEM, blob)
+        out = dict(_MEM)
+    if changed:
+        _write_disk(out)
+    return changed
+
+
+def _refresh_async() -> None:
+    """تازه سازی در پس زمینه — درخواست وب منتظر شبکه نمی ماند."""
+    t = threading.Thread(target=_pull_remote, daemon=True,
+                         name="snapshot-refresh")
+    t.start()
+
+
+def _all() -> Dict[str, Any]:
+    """همه ورودی ها. ترتیب: حافظه → دیسک → ریپو.
+
+    ⚠ اصلاح ۲۰۲۶-۱۰-۰۱ — باگ «شاخه ریپو هیچ وقت اجرا نمی شد».
+
+    نسخه قبلی اگر دیسک چیزی داشت همان جا return می کرد، پس
+    _read_remote عملا کد مرده بود. اما snapshot_cache.json همراه
+    دیپلوی روی دیسک می آید و کامیت های انبار برچسب [skip render]
+    دارند، یعنی نسخه دیسک فقط موقع دیپلوی واقعی عوض می شود.
+    نتیجه: داده روی لحظه آخرین دیپلوی یخ می زد، از MAX_AGE رد
+    می شد، get() مقدار None می داد و هر درخواست یک محاسبه زنده
+    چند دقیقه ای راه می انداخت که با تک ورکر کل سایت را قفل می کرد.
+
+    حالا: اگر تازه ترین ورودی از _REFRESH_AFTER کهنه تر باشد سراغ
+    ریپو می رویم — در پس زمینه اگر داده ای (هرچند کهنه) داریم، و
+    فقط در حالت دست خالی منتظر شبکه می مانیم.
+    """
+    global _MEM, _remote_at
     with _LOCK:
         if not _MEM:
-            _MEM.update(blob)
-        out = dict(_MEM)
-    _write_disk(out)               # دفعه بعد از دیسک، بدون شبکه
-    return out
+            _MEM = _read_disk()
+        now = time.time()
+        have = bool(_MEM)
+        stale = _newest(_MEM) < (now - _REFRESH_AFTER)
+        if have and not stale:
+            return dict(_MEM)
+        due = bool(_REMOTE) and (now - _remote_at) >= _REMOTE_TTL
+        if not due:
+            return dict(_MEM)
+        _remote_at = now
+        cur = dict(_MEM)
+    if have:
+        _refresh_async()           # کهنه ولی موجود ⇒ کاربر منتظر نماند
+        return cur
+    # دست خالی ⇒ چاره ای جز انتظار نیست (فقط اولین درخواست بعد از بوت)
+    _pull_remote()
+    with _LOCK:
+        return dict(_MEM)
 
 
 def save(key: str, payload: Any, built_at: Optional[float] = None) -> Dict:
@@ -194,6 +271,28 @@ def get(key: str, max_age: Optional[int] = None) -> Optional[Dict]:
         return None
     return {"payload": e.get("payload"), "age": age,
             "built_at": e.get("built_at")}
+
+
+def get_any(key: str) -> Optional[Dict]:
+    """ورودی را بدون توجه به سن برگردان، با برچسب کهنگی.
+
+    ⚠ اصلاح ۲۰۲۶-۱۰-۰۱. روی Render رایگان (۰.۱ هسته) یک محاسبه
+    زنده agent.decide بیش از ۵ دقیقه طول می کشد و چون فقط یک
+    ورکر داریم، تمام سایت در آن مدت بی پاسخ می شود. پس وقتی
+    انبار از MAX_AGE رد شده، به جای محاسبه زنده همان عدد کهنه
+    را می دهیم و سنش را صریح اعلام می کنیم — دقیقا همان چیزی
+    که در توضیح MAX_AGE قول داده شده بود ولی پیاده نشده بود.
+    """
+    e = (_all() or {}).get(key)
+    if not isinstance(e, dict):
+        return None
+    try:
+        built = float(e.get("built_at") or 0)
+    except (TypeError, ValueError):
+        built = 0.0
+    age = time.time() - built
+    return {"payload": e.get("payload"), "age": age, "built_at": built,
+            "stale": age > MAX_AGE, "age_fa": _age_fa(age)}
 
 
 def age_of(key: str) -> Optional[float]:
