@@ -736,9 +736,21 @@ def decide(interval: str = "1h", equity: float = 100_000,
     )
 
     # ثبت در دفترچه — برای کالیبراسیون آینده (بی صدا شکست می خورد)
+    #
+    # price اینجا عمدا خام است (برای داوجونز یعنی DIA ≈ ۵۱۲) چون
+    # journal.evaluate همین نماد خام را دوباره می گیرد و اگر دو طرف
+    # هم مقیاس نباشند R بی معنا می شود. ضریب نمایش جدا فرستاده
+    # می شود تا رکورد هم خام را داشته باشد هم عددی که کاربر دیده.
+    # ⚠ از k استفاده نمی کنیم: وقتی scale=False باشد (ورک فلو)،
+    # k برابر ۱ است ولی عدد روی صفحه همچنان ۱۰۰ برابر است.
     try:
         if abs(float(out["decision"]["score"])) >= 1.0:
-            jr.record(out, prof["key"], interval, price=price)
+            if prof["basis_mode"] == "scale":
+                disp_k = float(prof["display_scale"])
+            else:
+                disp_k = (float(bas.get("factor", 1.0))
+                          if bas.get("ok") else 1.0)
+            jr.record(out, prof["key"], interval, price=price, scale=disp_k)
     except Exception:
         pass
 
@@ -822,7 +834,13 @@ def journal_from_decision(d: Dict) -> Dict:
     rec = dict(
         ts=meta.get("generated"), interval=meta.get("interval"),
         asset=meta.get("asset") or ctx.get("asset"),
-        price=meta.get("price"), direction=dec.get("direction"),
+        # ⚠ برخلاف journal.record، اینجا price به مقیاس *نمایش* است
+        # (همان عددی که کاربر دیده). برای اینکه رکورد خودتوضیح باشد،
+        # قیمت خام و ضریب هم کنارش می آید.
+        price=meta.get("price"),
+        raw_price=meta.get("raw_price"),
+        scale=meta.get("scale"),
+        direction=dec.get("direction"),
         label=dec.get("label"), grade=dec.get("grade"),
         score=dec.get("score"), confidence=dec.get("confidence"),
         gate=(ctx.get("gate") or {}).get("mode"), tags=tags,
