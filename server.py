@@ -233,6 +233,26 @@ def api_enginetest():
         return jsonify(dict(ok=False, error=str(e)[:200])), 200
 
 
+@app.route("/api/validated")
+def api_validated():
+    """سیگنال اعتبارسنجی شده — تنها لبه ای که بک تست تاییدش کرده.
+
+    جدا از /api/agent است چون مقیاس امتیازش فرق دارد: ایجنت ۲۵ جزء
+    دارد که ۷۰٪ وزنشان شبکه ای و غیرقابل بازپخش تاریخی است، پس روی
+    آن هیچ آستانه ای اعتبارسنجی نشده. اینجا همان موتوری اجرا می شود
+    که آستانه ۳۲ از آن درآمده.
+    """
+    try:
+        import validated as vd
+        d = vd.cached(asset=_asset(),
+                      interval=request.args.get("interval", "1d"),
+                      force=request.args.get("fresh", "0") == "1")
+        return jsonify(ok=bool(d.get("ok")), data=d)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify(ok=False, error=str(e)[:200]), 500
+
+
 @app.route("/api/dowcash")
 def api_dowcash():
     """قیمت نقدی داوجونز، منطبق با پلتفرم های معاملاتی.
