@@ -3178,13 +3178,23 @@ function runLayers(fresh){
            : 'پاسخ نامعتبر از سرور ('+r.status+')');}});})
    .then(function(j){
      if(!j.ok) throw new Error(j.error||'خطا');
+     runLayers._retried = false;
      body.innerHTML=renderLayers(j.data);
      tg.textContent=(j.data.features?j.data.features.n+' ویژگی':'')+' · تایم‌فریم '+IV;
    })
    .catch(function(e){
      /* ۵۰۳ «محاسبه در جریان است» خطا نیست — نگهبانی است که جلوی
-        قفل شدن سایت را می‌گیرد. پیام آرام بده، نه قرمز ترسناک. */
+        قفل شدن سایت را می‌گیرد. پیام آرام بده، نه قرمز ترسناک،
+        و یک بار خودکار دوباره تلاش کن. */
      var busy = /محاسبه سنگین/.test(e.message||'');
+     if(busy && !runLayers._retried){
+       runLayers._retried = true;
+       body.innerHTML='<div class="load"><div class="spin"></div>'
+        +'سرور مشغول بود — ۷ ثانیه دیگر دوباره تلاش می‌کنم…</div>';
+       tg.textContent='در صف';
+       setTimeout(function(){ runLayers(fresh); }, 7000);
+       return;
+     }
      body.innerHTML = busy
        ? '<div class="note" style="border-right-color:var(--warn)">⏳ '
          +e.message+'</div>'

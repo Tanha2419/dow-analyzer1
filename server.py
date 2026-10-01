@@ -172,7 +172,9 @@ def api_quality():
                 # نداشت و عملا هیچ وقت فعال نمی شد.
                 # حالا از همان موتوری می خوانیم که آستانه از آن درآمده.
                 import validated as vd
-                v = vd.cached(asset=a, interval=iv)
+                # همان کش و نگهبانِ /api/validated — دو بار محاسبه نشود
+                v = _guarded(f"validated:{a}:{iv}", 180.0,
+                             lambda: vd.cached(asset=a, interval=iv))
                 if not v.get("ok"):
                     return jsonify(dict(
                         ok=False,
@@ -181,6 +183,8 @@ def api_quality():
                 sc = v["score"]
             out = sf.assess(a, float(sc), iv)
         return jsonify(web_api._clean(out))
+    except _Busy:
+        return jsonify(dict(ok=False, error=BUSY_FA)), 503
     except Exception as e:
         return jsonify(dict(ok=False, error=str(e)[:200])), 200
 
@@ -242,12 +246,19 @@ def api_validated():
     آن هیچ آستانه ای اعتبارسنجی نشده. اینجا همان موتوری اجرا می شود
     که آستانه ۳۲ از آن درآمده.
     """
+    a, iv = _asset(), request.args.get("interval", "1d")
+    force = request.args.get("fresh", "0") == "1"
+    key = f"validated:{a}:{iv}"
+    if force:
+        with _RLOCK:
+            _RCACHE.pop(key, None)
     try:
         import validated as vd
-        d = vd.cached(asset=_asset(),
-                      interval=request.args.get("interval", "1d"),
-                      force=request.args.get("fresh", "0") == "1")
+        d = _guarded(key, 180.0,
+                     lambda: vd.cached(asset=a, interval=iv, force=force))
         return jsonify(ok=bool(d.get("ok")), data=d)
+    except _Busy:
+        return jsonify(ok=False, error=BUSY_FA), 503
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)[:200]), 500
@@ -373,10 +384,18 @@ def api_analysis():
     coalition = request.args.get("coalition", "1") != "0"
     force = request.args.get("force", "0") == "1"
     scale = request.args.get("scale", "1") != "0"
+    a = _asset()
+    key = f"analysis:{a}:{interval}:{bars}:{int(coalition)}:{int(scale)}"
+    if force:
+        with _RLOCK:
+            _RCACHE.pop(key, None)
     try:
-        data = web_api.cached_payload(interval, bars, coalition, force, scale,
-                                      asset=_asset())
-        return jsonify(ok=True, data=data)
+        return jsonify(ok=True, data=_guarded(
+            key, 180.0,
+            lambda: web_api.cached_payload(interval, bars, coalition,
+                                           force, scale, asset=a)))
+    except _Busy:
+        return jsonify(ok=False, error=BUSY_FA), 503
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
@@ -463,10 +482,60 @@ _RLOCK = _th.Lock()
 # نداریم؛ بقیه یا داده کهنه برچسب دار می گیرند یا پیام روشن.
 _HEAVY = _th.BoundedSemaphore(1)
 
+# چقدر پشت نوبت صبر کنیم. صفر یعنی فوری رد کن — ولی آن موقع
+# اولین باز شدن صفحه (که چند کارت را با هم می خواهد) پر از خطا
+# می شود. صبر کوتاهِ سقف دار هر دو مشکل را حل می کند: بار سبک
+# پشت سر هم سرو می شود، و بار سنگین به جای قفل کردن ورکر برای
+# چند دقیقه، با پیام روشن رد می شود.
+_HEAVY_WAIT = float(os.environ.get("HEAVY_WAIT_SEC", "12"))
 
-def _heavy_free() -> bool:
-    """آیا ظرفیت محاسبه سنگین آزاد است؟ (بدون انتظار)"""
-    return _HEAVY.acquire(blocking=False)
+
+def _heavy_free(wait: float | None = None) -> bool:
+    """ظرفیت محاسبه سنگین را بگیر؛ حداکثر wait ثانیه صبر کن."""
+    w = _HEAVY_WAIT if wait is None else wait
+    if w <= 0:
+        return _HEAVY.acquire(blocking=False)
+    return _HEAVY.acquire(timeout=w)
+
+
+BUSY_FA = ("یک محاسبه سنگین همین حالا در جریان است. "
+           "چند لحظه دیگر دوباره بزنید.")
+
+
+class _Busy(Exception):
+    """ظرفیت محاسبه پر است و کشی هم نداریم."""
+
+
+def _guarded(key: str, ttl: float, builder):
+    """داده را از کش بده، وگرنه بساز — ولی هرگز صف نکش.
+
+    ⚠ اصلاح ۱ اکتبر (سوم). تا امروز فقط layers و agent محافظت
+    داشتند. بقیه مسیرها نه کش داشتند نه نگهبان، پس چند درخواست
+    پشت سر هم روی ۰.۱ هسته تک ورکر را کامل می بست و سایت — حتی
+    ‎/api/ping — بی پاسخ می شد.
+
+    ترتیب:
+      ۱. کش داغ            ⇒ فوری
+      ۲. ظرفیت آزاد        ⇒ بساز (پشت قفل همان کلید)
+      ۳. ظرفیت پر + کش سرد ⇒ نسخه کهنه کش، وگرنه _Busy
+
+    صف کشیدن روی ۰.۱ هسته یعنی مرگ سایت، پس هیچ وقت صف نمی کشیم.
+    """
+    now = _time.time()
+    with _RLOCK:
+        hit = _RCACHE.get(key)
+        if hit and hit.get("data") and (now - hit["at"]) < ttl:
+            return hit["data"]
+    if not _heavy_free():
+        with _RLOCK:
+            hit = _RCACHE.get(key)
+        if hit and hit.get("data"):
+            return hit["data"]          # کهنه، ولی بی نهایت بهتر از قفل
+        raise _Busy()
+    try:
+        return _route_cache(key, ttl, builder)
+    finally:
+        _HEAVY.release()
 
 
 def _snap_stale(key: str, conv):
@@ -617,17 +686,29 @@ def api_board():
     نمایش دارایی برمی گردند تا با پلتفرم کاربر یکی باشند.
     خروجی رویدادها را هم به روز می کند.
     """
-    try:
+    a = _asset()
+    force = request.args.get("fresh", "0") == "1"
+    key = f"board:{a}"
+    if force:
+        with _RLOCK:
+            _RCACHE.pop(key, None)
+
+    def _build():
         import board as bd
-        a = _asset()
-        d = bd.cached(force=request.args.get("fresh", "0") == "1", asset=a)
+        import events as ev
+        d = bd.cached(force=force, asset=a)
         # هر بار که نقشه تازه شد، رویدادها را هم بسنج
         try:
-            import events as ev
             d["events"] = ev.update(d, a).get("events", [])[:12]
         except Exception:
             d["events"] = []
+        return d
+
+    try:
+        d = _guarded(key, 240.0, _build)
         return jsonify(ok=bool(d.get("ok")), data=d)
+    except _Busy:
+        return jsonify(ok=False, error=BUSY_FA), 503
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)[:200]), 500
@@ -640,9 +721,14 @@ def api_window():
     معیار: هزینه رفت و برگشت تقسیم بر نوسان متوسط همان ساعت.
     آمار توصیفی است، نه پیش بینی جهت.
     """
+    a = _asset()
     try:
         import window as wn
-        return jsonify(ok=True, data=wn.status(_asset()))
+        return jsonify(ok=True,
+                       data=_guarded(f"window:{a}", 240.0,
+                                     lambda: wn.status(a)))
+    except _Busy:
+        return jsonify(ok=False, error=BUSY_FA), 503
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)[:200]), 500
@@ -816,8 +902,10 @@ def api_flow():
         return web_api._clean(d)
 
     try:
-        return jsonify(ok=True, data=_route_cache(
+        return jsonify(ok=True, data=_guarded(
             f"flow:{asset}:{iv}", 300.0, _build))
+    except _Busy:
+        return jsonify(ok=False, error=BUSY_FA), 503
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
@@ -924,23 +1012,35 @@ def api_real():
 
 @app.route("/api/plan")
 def api_plan():
-    """برگه طرح معامله — ورود، حد ضرر، حد سود، و دلیل هر کدام."""
-    try:
+    """برگه طرح معامله — ورود، حد ضرر، حد سود، و دلیل هر کدام.
+
+    ⚠ سنگین ترین مسیر سایت: ۹.۶ ثانیه محلی، یعنی حدود ۱۴۴ ثانیه
+    روی ۰.۱ هسته Render. حتما پشت کش و نگهبان.
+    """
+    a = _asset()
+    iv = request.args.get("interval", "1h")
+    if iv not in web_api.INTERVAL_PERIODS:
+        return jsonify(ok=False, error="تایم فریم نامعتبر"), 400
+    equity = float(request.args.get("equity", 100000))
+    risk = float(request.args.get("risk", 1.0))
+    multi = request.args.get("multi", "0") == "1"
+    ivs = [x for x in request.args.get("intervals", "1h,1d").split(",")
+           if x in web_api.INTERVAL_PERIODS]
+
+    def _build():
         import tradeplan
-        a = _asset()
-        iv = request.args.get("interval", "1h")
-        if iv not in web_api.INTERVAL_PERIODS:
-            return jsonify(ok=False, error="تایم فریم نامعتبر"), 400
-        equity = float(request.args.get("equity", 100000))
-        risk = float(request.args.get("risk", 1.0))
-        multi = request.args.get("multi", "0") == "1"
         if multi:
-            ivs = [x for x in request.args.get("intervals", "1h,1d").split(",")
-                   if x in web_api.INTERVAL_PERIODS]
             d = tradeplan.build_multi(a, ivs or ["1h", "1d"], equity, risk)
         else:
             d = tradeplan.build_plan(a, iv, equity, risk)
-        return jsonify(ok=True, data=web_api._clean(d))
+        return web_api._clean(d)
+
+    key = (f"plan:{a}:{'m:' + ','.join(ivs) if multi else iv}"
+           f":{equity:.0f}:{risk:.2f}")
+    try:
+        return jsonify(ok=True, data=_guarded(key, 600.0, _build))
+    except _Busy:
+        return jsonify(ok=False, error=BUSY_FA), 503
     except Exception as e:
         traceback.print_exc()
         return jsonify(ok=False, error=str(e)), 500
