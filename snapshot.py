@@ -22,6 +22,20 @@ from typing import Any, Dict, Optional
 # ولی چون اکشنز هر ۱۵ دقیقه دوباره پوش می کند، خودش را ترمیم می کند.
 _PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/dow_snapshot.json")
 
+# نسخه ای که همراه دیپلوی می آید.
+#
+# ⚠ کشف ۱ اکتبر: _PATH زیر /tmp است و Render با هر ری استارت
+# آن را پاک می کند. تا امروز تنها چیزی که انبار را پر می کرد،
+# پوش مستقیم اکشنز به /api/snapshot بود — یعنی بعد از هر دیپلوی
+# تا اجرای بعدی اکشنز (۳ تا ۴ ساعت بعد) انبار خالی می ماند و
+# هر درخواست یک محاسبه زنده چند دقیقه ای می شد.
+#
+# ولی snapshot_cache.json در خود ریپو کامیت می شود و همراه هر
+# دیپلوی کنار کد روی دیسک می نشیند. پس بوت سرد هم بدون حتی یک
+# درخواست شبکه داده دارد.
+_BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "snapshot_cache.json")
+
 # ── انبار پشتیبان روی ریپو (اصلاح ۲۰۲۶-۰۹-۳۰) ─────────────────────
 #
 # مشکلی که کشف شد: /tmp روی Render رایگان موقتی است. سرویس بعد از
@@ -50,11 +64,18 @@ _PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/dow_snapshot.json")
 #
 # خارج از Render (مثلا اجرای محلی) این متغیرها وجود ندارند و
 # _REMOTE خالی می ماند، یعنی رفتار دقیقا مثل قبل است.
+# اگر Render متغیر RENDER_GIT_REPO_SLUG را ندهد، به این ریپو
+# برمی گردیم. ریپو عمومی است پس توکن لازم نیست، و کاربر مجبور
+# نیست در پنل Render (که بخش Environment را در دسترس ندارد)
+# چیزی تنظیم کند. با SNAPSHOT_REMOTE قابل بازنویسی است.
+_FALLBACK_SLUG = "Tanha2419/dow-analyzer1"
+
+
 def _default_remote() -> str:
     slug = (os.environ.get("RENDER_GIT_REPO_SLUG") or "").strip().strip("/")
-    if not slug or "/" not in slug:
-        return ""
     branch = (os.environ.get("RENDER_GIT_BRANCH") or "main").strip() or "main"
+    if not slug or "/" not in slug:
+        slug, branch = _FALLBACK_SLUG, "main"
     return ("https://raw.githubusercontent.com/%s/%s/snapshot_cache.json"
             % (slug, branch))
 
@@ -101,11 +122,23 @@ def check_key(given: Optional[str]) -> bool:
 
 
 def _read_disk() -> Dict[str, Any]:
-    try:
-        with open(_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    """اول /tmp (نوشته پوش اکشنز)، بعد نسخه همراه دیپلوی.
+
+    هر دو خوانده و ادغام می شوند تا تازه ترین نسخه هر کلید بماند —
+    ممکن است /tmp یک کلید تازه تر داشته باشد و فایل ریپو کلید دیگری.
+    """
+    out: Dict[str, Any] = {}
+    for p in (_BUNDLED, _PATH):          # ترتیب: قدیمی تر اول، تازه تر رویش
+        if not p:
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+        except Exception:
+            continue
+        if isinstance(blob, dict) and blob:
+            _merge(out, blob)
+    return out
 
 
 def _write_disk(blob: Dict[str, Any]) -> None:
