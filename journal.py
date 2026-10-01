@@ -55,13 +55,40 @@ def _bucket(ts: datetime, interval: str) -> str:
     return "%s %02d:%02d" % (ts.strftime("%Y-%m-%d"), slot // 60, slot % 60)
 
 
+def _display_scale(asset: str) -> float:
+    """ضریب تبدیل قیمت خام فید به عددی که کاربر روی صفحه می بیند.
+
+    داوجونز از DIA خوانده می شود که تقریبا یک صدم شاخص است، پس ۱۰۰.
+    طلا از GC=F می آید و ضریبش نزدیک ۱ است.
+    """
+    try:
+        import assets as A
+        prof = A.profile(asset)
+        if prof.get("basis_mode") == "scale":
+            return float(prof.get("display_scale") or 1.0)
+    except Exception:
+        pass
+    return 1.0
+
+
 def record(decision: Dict, asset: str, interval: str,
-           price: Optional[float] = None) -> Dict:
+           price: Optional[float] = None,
+           scale: Optional[float] = None) -> Dict:
     """یک تصمیم را ثبت می کند.
 
     ⚠️ یک رکورد به ازای هر کندل، نه هر فراخوان. اگر کاربر ۲۰ بار
     رفرش کند، ۲۰ نمونه وابسته ثبت نمی شود — رکورد موجود فقط
     به روز می شود. بدون این، نرخ برد بی معنا می شد.
+
+    ⚠️ درباره مقیاس قیمت (۱ اکتبر ۲۰۲۶):
+    فیلد price عمدا قیمت *خام فید* است (برای داوجونز یعنی DIA،
+    حدود ۵۱۲ به جای ۵۱٬۲۶۸). تابع evaluate هم همین نماد خام را
+    دوباره می گیرد، پس ورود و خروج هم مقیاس اند و R درست درمی آید.
+    عوض کردن price به مقیاس نمایش، تمام رکوردهای جدید را ۱۰۰ برابر
+    غلط ارزیابی می کرد. به جایش دو فیلد *اضافه* شد:
+      • scale          → ضریب تبدیل
+      • price_display  → همان عددی که روی صفحه دیده می شود
+    حالا رکورد خودش خودش را توضیح می دهد و قدیمی ها هم معتبر می مانند.
     """
     try:
         dec = decision.get("decision") or {}
@@ -73,6 +100,7 @@ def record(decision: Dict, asset: str, interval: str,
             return dict(ok=False, error="قیمت در دسترس نیست")
 
         gate = (decision.get("institutional") or {}).get("gate") or {}
+        sc = float(scale if scale is not None else _display_scale(asset)) or 1.0
         now = _now()
         bkt = _bucket(now, interval)
         rid = "%s-%s-%s" % (asset, interval, bkt.replace(" ", "T"))
@@ -80,7 +108,11 @@ def record(decision: Dict, asset: str, interval: str,
             id=rid, bucket=bkt, updates=1,
             ts=now.isoformat(),
             asset=asset, interval=interval,
-            price=float(price), score=score, label=label,
+            # price خام است و evaluate به همین وابسته — دست نزنید.
+            price=float(price),
+            scale=sc,
+            price_display=round(float(price) * sc, 4),
+            score=score, label=label,
             conf=float(dec.get("confidence") or 0),
             grade=str(dec.get("grade") or ""),
             allowed=bool(gate.get("allowed", True)),
@@ -97,6 +129,9 @@ def record(decision: Dict, asset: str, interval: str,
                 rec["updates"] = int(r.get("updates", 1)) + 1
                 rec["ts"] = r["ts"]          # زمان اولین تصمیم می ماند
                 rec["price"] = r["price"]    # قیمت ورود اولیه می ماند
+                # نمایش هم باید با همان قیمت اولیه بخواند
+                rec["price_display"] = r.get(
+                    "price_display", round(float(r["price"]) * sc, 4))
                 rows[i] = rec
                 _save(rows)
                 return dict(ok=True, id=rid, updated=True)
@@ -160,6 +195,15 @@ def _better(a: Dict, b: Dict) -> Dict:
         if str(lose.get("ts") or "") and str(lose.get("ts")) < str(out.get("ts") or "~"):
             out["ts"] = lose["ts"]
             out["price"] = lose["price"]
+            # نمایش باید با همان قیمتِ ورودِ حفظ شده جابجا شود،
+            # وگرنه price و price_display دو لحظه متفاوت را نشان می دهند
+            if "price_display" in lose:
+                out["price_display"] = lose["price_display"]
+            elif "scale" in out:
+                out["price_display"] = round(
+                    float(lose["price"]) * float(out["scale"] or 1.0), 4)
+            else:
+                out.pop("price_display", None)
     except Exception:
         pass
     return out
