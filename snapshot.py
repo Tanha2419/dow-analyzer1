@@ -41,7 +41,25 @@ _PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/dow_snapshot.json")
 #
 # اگر ریپو پرایوت شود این آدرس ۴۰۴ می دهد و بی صدا به محاسبه زنده
 # برمی گردیم — یعنی رفتار بدتر از قبل نمی شود.
-_REMOTE = (os.environ.get("SNAPSHOT_REMOTE") or "").strip()
+# آدرس فایل پشتیبان. اگر دستی تنظیم نشود، خودش از متغیرهایی که
+# Render به طور خودکار می سازد ساخته می شود — یعنی کاربر لازم نیست
+# هیچ چیزی در پنل Render تنظیم کند.
+#
+#     RENDER_GIT_REPO_SLUG = نام کاربری/نام ریپو
+#     RENDER_GIT_BRANCH    = main
+#
+# خارج از Render (مثلا اجرای محلی) این متغیرها وجود ندارند و
+# _REMOTE خالی می ماند، یعنی رفتار دقیقا مثل قبل است.
+def _default_remote() -> str:
+    slug = (os.environ.get("RENDER_GIT_REPO_SLUG") or "").strip().strip("/")
+    if not slug or "/" not in slug:
+        return ""
+    branch = (os.environ.get("RENDER_GIT_BRANCH") or "main").strip() or "main"
+    return ("https://raw.githubusercontent.com/%s/%s/snapshot_cache.json"
+            % (slug, branch))
+
+
+_REMOTE = (os.environ.get("SNAPSHOT_REMOTE") or "").strip() or _default_remote()
 _REMOTE_TTL = 300.0          # حداکثر هر ۵ دقیقه یک بار از گیت هاب بخوان
 _remote_at = 0.0
 
