@@ -572,6 +572,18 @@ def decide(interval: str = "1h", equity: float = 100_000,
                      "از قبل روی صفحه مانده مربوط به محاسبه قبلی است "
                      "و دیگر معتبر نیست."),
         )
+    elif not base.get("plan"):
+        # جهت مشخص است ولی موتور ساختار بازار هیچ سطح ورودی نداد.
+        # قبلا در این حالت plan خالی {} می ماند و کارت بی صدا خالی
+        # می شد؛ کاربر فکر می کرد عدد قبلی هنوز معتبر است.
+        plan = dict(
+            empty=True,
+            reason_fa=f"{label} — ولی سطح ورود پیدا نشد",
+            note_fa=("جهت مشخص است، اما موتور ساختار بازار در این "
+                     "تایم فریم سطح ورود معتبری نیافت، پس عددی ساخته "
+                     "نمی شود. هر عددی که از قبل روی صفحه مانده مربوط "
+                     "به محاسبه قبلی است و دیگر معتبر نیست."),
+        )
     if direction != 0 and base.get("plan"):
         bp = base["plan"]
         entry = float(bp["entry"])
@@ -772,7 +784,11 @@ def journal_from_decision(d: Dict) -> Dict:
         label=d["decision"]["label"], grade=d["decision"]["grade"],
         score=d["decision"]["score"], confidence=d["decision"]["confidence"],
         gate=ctx["gate"]["mode"], tags=tags,
-        plan=None if not d.get("plan") else dict(
+        # ⚠ باگ ۲۰۲۶-۰۹-۳۰: اینجا فقط truthy بودن plan چک می شد.
+        # وقتی طرح خالی را از {} به {"empty": True, ...} تغییر دادم،
+        # این شرط رد شد و d["plan"]["entry"] خطای KeyError داد.
+        # حالا وجود خود کلید entry بررسی می شود.
+        plan=None if not (d.get("plan") or {}).get("entry") else dict(
             entry=d["plan"]["entry"], stop=d["plan"]["stop"],
             tp1=d["plan"]["tp1"],
             units=d["plan"]["sizing"]["units"],
